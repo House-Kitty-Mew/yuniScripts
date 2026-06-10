@@ -54,6 +54,8 @@ def test(name: str, condition: bool, detail: str = ""):
         if detail:
             print(f"         {_Y}{detail}{_N}")
 
+test.__test__ = False
+
 def skip(name: str, reason: str = ""):
     global _tests_skip
     _tests_skip += 1

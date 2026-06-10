@@ -53,6 +53,8 @@ def test(name: str, condition: bool, detail: str = ""):
         if detail:
             print(f"         {_Y}{detail}{_N}")
 
+test.__test__ = False
+
 def section(title: str):
     print(f"\n{_C}─── {title} ───{_N}")
 
