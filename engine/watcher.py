@@ -4,11 +4,14 @@ Supports two backends:
   1. watchdog (preferred) — efficient OS-level file notifications
   2. Polling fallback — periodic stat() checks when watchdog is unavailable
 """
+import logging
 import time
 import os
 from queue import Queue
 from pathlib import Path
-from typing import Dict, Optional, Callable
+from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 # ── Backend selection ───────────────────────────────────────────────
 try:
@@ -100,7 +103,6 @@ if _HAVE_WATCHDOG:
                         break
             except Exception as e:
                 logger.error(f"_handle failed: {e}")
-                return None
 
 
 def _create_watchdog_watcher(script_instance: Dict, queue: Queue) -> Dict:
@@ -192,11 +194,11 @@ def create_watcher(script_instance: Dict, queue: Queue) -> Dict:
 
 
 def start_watcher(watcher_state: Dict) -> Dict:
+    """Start the watcher (watchdog observer or polling thread)."""
     try:
-        """Start the watcher (watchdog observer or polling thread)."""
         if watcher_state["active"]:
             return watcher_state
-    
+
         backend = watcher_state.get("backend", "watchdog")
         if backend == "watchdog" and _HAVE_WATCHDOG:
             watcher_state["observer"].start()
@@ -208,7 +210,7 @@ def start_watcher(watcher_state: Dict) -> Dict:
                                  daemon=True, name=f"poll-watcher-{watcher_state['script_id']}")
             watcher_state["_poll_thread"] = t
             t.start()
-    
+
         return {**watcher_state, "active": True}
     except Exception as e:
         logger.error(f"start_watcher failed: {e}")
@@ -216,11 +218,11 @@ def start_watcher(watcher_state: Dict) -> Dict:
 
 
 def stop_watcher(watcher_state: Dict) -> Dict:
+    """Stop the watcher."""
     try:
-        """Stop the watcher."""
         if not watcher_state["active"]:
             return watcher_state
-    
+
         backend = watcher_state.get("backend", "watchdog")
         if backend == "watchdog" and _HAVE_WATCHDOG:
             watcher_state["observer"].stop()
@@ -228,7 +230,7 @@ def stop_watcher(watcher_state: Dict) -> Dict:
         elif backend == "polling":
             watcher_state["active"] = False
             # Thread will exit on next poll interval check
-    
+
         return {**watcher_state, "active": False}
     except Exception as e:
         logger.error(f"stop_watcher failed: {e}")
@@ -238,34 +240,33 @@ def stop_watcher(watcher_state: Dict) -> Dict:
 def reload_script(registry: Dict, running: Dict, script_id: str,
                   watchers: Dict, debounce_seconds: float = 2.0,
                   log_base_dir: Path = None) -> tuple:
+    """Reload a script by stopping and re-starting it, with debounce."""
     try:
-        """Reload a script by stopping and re-starting it, with debounce."""
         now = time.time()
         if script_id in watchers:
             last = watchers[script_id].get("last_reload_time", 0.0)
             if now - last < debounce_seconds:
                 return registry, running, watchers, False
-    
+
         if script_id not in registry:
             return registry, running, watchers, False
-    
+
         inst = registry[script_id]
         proc_info = running.get(script_id)
-    
+
         from engine.process_wrapper import stop_script, start_script
-    
+
         if proc_info and proc_info.get("status") in ("running", "starting"):
             proc_info = stop_script(proc_info)
             running[script_id] = proc_info
-    
+
         new_proc = start_script(inst, log_base_dir=log_base_dir)
         running[script_id] = new_proc
-    
+
         if script_id in watchers:
             watchers[script_id] = {**watchers[script_id], "last_reload_time": now}
-    
+
         return registry, running, watchers, True
     except Exception as e:
         logger.error(f"reload_script failed: {e}")
         return ()
-

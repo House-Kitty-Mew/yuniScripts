@@ -23,10 +23,13 @@ Usage:
     assert_valid_config("minecraft_manager", cfg)
 """
 
-import json, os, threading, shutil
+import json
+import os
+import threading
+import shutil
 from pathlib import Path
 from configparser import ConfigParser
-from typing import Optional, Any
+from typing import Optional
 
 # ── Globals ─────────────────────────────────────────────────────────
 

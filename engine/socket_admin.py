@@ -3,7 +3,6 @@ Cross-platform: uses tempfile.gettempdir() for Unix socket path, not hardcoded /
 import os
 import sys
 import socket
-import select
 import threading
 import tempfile
 from typing import Dict, Callable

@@ -1,9 +1,13 @@
 """Pure functional script registry management with validation."""
+import logging
 from pathlib import Path
 import json
 import sys
 import importlib.util
 from .metadata import load_meta
+
+logger = logging.getLogger(__name__)
+
 
 def _script_id(scripts_root: Path, script_dir: Path) -> str:
     """Return a script ID with forward slashes, safe across all platforms."""

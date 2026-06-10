@@ -1,0 +1,3 @@
+# Datagram
+# Forward/backward compatible data archive format (PowerShell-based)
+# No Python dependencies - PowerShell script project

@@ -20,8 +20,6 @@ import socket
 import threading
 import queue
 import time
-import os
-
 from engine.ports import PHOOKS_HUB_PORT
 HUB_HOST = "127.0.0.1"
 

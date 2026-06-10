@@ -30,10 +30,14 @@ import subprocess
 import sys
 import os
 import shutil
-import json
 import importlib
+import logging
 import importlib.util
 from pathlib import Path
+
+from engine.config_loader import get_config_path, save_config, load_config, is_fresh_install
+
+logger = logging.getLogger(__name__)
 
 # ---- Configuration ----
 ENGINE_DIR = Path(__file__).resolve().parent
@@ -44,7 +48,6 @@ FIRST_RUN_SETUP = ENGINE_DIR / "SCRIPTS" / "TOOLS" / "first-run-setup" / "main.p
 # Config now lives in DATA/engine_config.json (centralized)
 # Migrate from old location on first access
 _old_config = ENGINE_DIR / "engine_config.json"
-from engine.config_loader import get_config_path, save_config, load_config, is_fresh_install, mark_setup_complete
 ENGINE_CONFIG = get_config_path("engine")
 if _old_config.exists() and not ENGINE_CONFIG.exists():
     import shutil

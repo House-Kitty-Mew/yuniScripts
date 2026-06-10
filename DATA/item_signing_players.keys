@@ -1,0 +1,4 @@
+# players.keys – per‑player encryption keys (base64)
+# to generate a new key use python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+Coochie_Tickler = lfOsO2R4ir5dyZ1TsrwgC54TzgwIaovv+MnloZ4kGTg=
+3DXNacat = wjSgtFdN5xXHvgU/h1uxiBr/nvztIBnOej1nIUIqV6A=

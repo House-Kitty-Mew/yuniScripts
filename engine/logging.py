@@ -1,6 +1,6 @@
 """Per‑script log capture with simple rotation."""
 from pathlib import Path
-from logging.handlers import RotatingFileHandler
+
 import io
 import shutil
 

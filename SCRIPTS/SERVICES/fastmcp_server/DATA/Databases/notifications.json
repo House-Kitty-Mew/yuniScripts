@@ -1,0 +1,72 @@
+[
+  {
+    "id": 1,
+    "timestamp": "2026-06-07T15:45:10.570771+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-07T15:45:28.646903+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:01:11.747698+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:01:18.546491+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:01:22.703863+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:03:56.397872+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:04:17.373647+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:04:56.792396+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:05:11.182774+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  },
+  {
+    "id": 1,
+    "timestamp": "2026-06-10T07:15:14.117250+00:00",
+    "type": "test",
+    "message": "Test notification",
+    "severity": "info"
+  }
+]

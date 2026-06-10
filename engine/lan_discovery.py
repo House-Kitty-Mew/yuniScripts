@@ -38,7 +38,6 @@ import socket
 import json
 import threading
 import time
-import os
 from typing import Optional, Callable
 
 from engine.ports import LAN_DISCOVERY_PORT
@@ -115,7 +114,7 @@ class ServiceBeacon:
             "extra": self.extra,
             "ts": 0,  # filled each loop
         }
-        payload_base = json.dumps(beacon)
+
         sock = self._sock
         while self._running and sock:
             try:
@@ -184,7 +183,7 @@ class ServiceFinder:
             try:
                 self._sock.bind(("", DISCOVERY_PORT))
                 break
-            except OSError as e:
+            except OSError:
                 _bind_attempts += 1
                 if _bind_attempts >= 3:
                     # Port might be in use — try any available port

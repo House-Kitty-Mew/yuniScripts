@@ -19,6 +19,7 @@ Cross-Platform:
     - TCP port check works identically on both platforms
 """
 
+import logging
 import os
 import sys
 import socket
@@ -26,7 +27,9 @@ import tempfile
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────
 

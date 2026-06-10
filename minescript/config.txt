@@ -1,0 +1,9 @@
+# Minescript configuration for YuniScripts integration
+# Lines starting with "#" are ignored.
+#
+# The autorun line below starts the MC status sender when Minescript loads.
+# Uncomment it to enable automatic biome/dimension reporting:
+#autorun[*]=mc_status_sender
+
+# Python interpreter path (default: /usr/bin/python3)
+python="/usr/bin/python3"

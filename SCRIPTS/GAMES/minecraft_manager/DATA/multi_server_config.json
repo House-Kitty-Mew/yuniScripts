@@ -1,0 +1,6 @@
+{
+    "runner_db_path": "/home/deck/Documents/dev-yuniScripts/SCRIPTS/SERVERS/mc-server-runner/DATA/server_data.db",
+    "runner_vfs_root": "/home/deck/Documents/dev-yuniScripts/SCRIPTS/SERVERS/mc-server-runner/vfs",
+    "default_rcon_host": "127.0.0.1",
+    "keepalive_interval_seconds": 30
+}

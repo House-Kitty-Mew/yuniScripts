@@ -8,6 +8,7 @@ import importlib.util
 import socket
 import threading
 from queue import Queue
+import queue
 from engine.manager import discover_scripts, apply_overrides, get_enabled_scripts, check_port_conflicts
 from engine.venv_manager import prepare_environment
 from engine.process_wrapper import (
@@ -17,11 +18,13 @@ from engine.process_wrapper import (
     start_script,
     STATUS_RUNNING,
 )
-from engine.watcher import create_watcher, start_watcher, stop_watcher, reload_script
+from engine.watcher import create_watcher, start_watcher, reload_script
 from engine.debug_utils import inject_debug_args
-from engine.hooks import create_hook_registry, register_hook, call_hooks
-from engine.config_loader import assert_valid_config, register_config_schema, load_config
-from engine.ports import UDP_ADMIN_PORT, PHOOKS_HUB_PORT, LAN_DISCOVERY_PORT, DEBUG_BASE_PORT
+from engine.hooks import create_hook_registry
+from engine.ports import UDP_ADMIN_PORT, DEBUG_BASE_PORT
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent / "SCRIPTS"

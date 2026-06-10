@@ -16,6 +16,7 @@ import time
 from typing import Optional, Callable
 
 from engine.ports import PHOOKS_HUB_PORT
+from engine.hooks import create_hook_registry, register_hook, call_hooks  # noqa: F401
 
 
 class PhooksHub:
@@ -204,5 +205,3 @@ class PhooksHub:
                     self._log("Failed to forward to {}: {}".format(sid, exc), "ERROR")
 
 
-# Engine-level hook registry functions — imported from hooks.py to avoid duplication.
-from engine.hooks import create_hook_registry, register_hook, call_hooks  # noqa: F401
