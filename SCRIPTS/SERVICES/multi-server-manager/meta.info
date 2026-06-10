@@ -1,0 +1,11 @@
+{
+    "name": "multi-server-manager",
+    "display_name": "Multi-Server Manager",
+    "version": "1.0.0",
+    "description": "Central management service for multiple game servers. Manages subsystem plugins, VFS-backed database isolation, server lifecycle, and admin auto-setup.",
+    "server_type": "critical",
+    "shutdown_timeout": 30,
+    "dependencies": ["phooks-hub"],
+    "authors": ["AIHandler"],
+    "license": "MIT"
+}

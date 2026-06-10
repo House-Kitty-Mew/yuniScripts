@@ -1,0 +1,33 @@
+{
+  "script_id": "TOOLS/gui-dashboard",
+  "version": "1.0.0",
+  "include_patterns": [
+    "*.py",
+    "*.json",
+    "*.md",
+    "*.info",
+    "*.txt",
+    "*.ini",
+    "*.cfg"
+  ],
+  "exclude_patterns": [
+    "__pycache__",
+    "*.pyc",
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__/*",
+    "*.egg-info",
+    ".gitignore",
+    ".DS_Store"
+  ],
+  "include_databases": true,
+  "include_venv": false,
+  "include_configs": false,
+  "config_sources": [],
+  "packaging": {
+    "compress": false,
+    "hash_algorithm": "SHA256",
+    "datagram_version": "1.0.0"
+  }
+}

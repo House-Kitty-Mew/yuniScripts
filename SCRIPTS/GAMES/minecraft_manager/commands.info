@@ -1,0 +1,25 @@
+[commands]
+start = Start the Minecraft server if not running.
+stop = Gracefully stop the server via RCON.
+status = Return server online status, player list, and TPS (JSON).
+command <text> = Send a raw command to the Minecraft server and return its response.
+ah list = Show active Auction House listing count.
+ah players <name> = Show a player's listings.
+ah simulate = Force-run an AI simulation cycle now.
+ah status = Show Auction House market health (listings, tx, events, scheduler).
+ah export = Export all AH data as JSON (listings, transactions, events).
+ah note <text> = Add an admin note to the AI helper database.
+# ── Multi-Server Commands ──────────────────────────
+servers = List all discovered servers from mc-server-runner with status.
+rcon <server> <cmd> = Send an RCON command to a specific server.
+broadcast <cmd> = Send an RCON command to ALL connected servers.
+custom-commands <server> = List custom commands for a server.
+custom-commands <server> add <name> <mc_cmds> = Add a custom command.
+custom-commands <server> remove <name> = Remove a custom command.
+custom-commands <server> run <name> = Run a custom command.
+subsystems <server> = List all subsystems and their status for a server.
+subsystems <server> list = List subsystems with details.
+subsystems <server> enable <name> = Enable a subsystem on a server.
+subsystems <server> disable <name> = Disable a subsystem on a server.
+detail <server> = Show full detail for a server (status, subsystems, custom commands).
+exit / quit = Shut down this manager script.

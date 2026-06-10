@@ -1,0 +1,31 @@
+{
+  "script_id": "SERVICES/decompile_rt",
+  "target_path": "SERVICES/decompile_rt",
+  "post_unpack_actions": [
+    {
+      "type": "register_script",
+      "enabled": true
+    },
+    {
+      "type": "install_dependencies",
+      "requirements_file": "requirements.txt"
+    },
+    {
+      "type": "restore_configs"
+    },
+    {
+      "type": "start_script",
+      "delay_seconds": 2
+    }
+  ],
+  "compatibility": {
+    "min_engine_version": "2.0.0",
+    "required_ports": []
+  },
+  "unpackaging": {
+    "extract_method": "directory_copy",
+    "overwrite_existing": false,
+    "create_backup": true,
+    "on_conflict": "skip"
+  }
+}

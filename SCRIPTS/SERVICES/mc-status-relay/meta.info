@@ -1,0 +1,10 @@
+[script]
+name = Minecraft Status Relay
+version = 1.0.0
+description = Receives Minescript UDP and answers status queries
+category = services
+entry_point = main.py
+enabled = true
+restart_policy = always
+watch_patterns = *.py
+ports = 25566, 25568

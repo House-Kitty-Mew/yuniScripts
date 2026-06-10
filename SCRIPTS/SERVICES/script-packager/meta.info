@@ -1,0 +1,12 @@
+[script]
+name = Script Packager
+version = 1.0.0
+description = Script snapshot, packaging, and deployment service for the YuniScripts ecosystem. Creates datagram snapshots of script states, supports preview/deploy rollback, and integrates with Phooks event bus.
+category = services
+entry_point = main.py
+enabled = true
+server_type = service
+shutdown_timeout = 10
+restart_policy = always
+watch_patterns = *.py, *.json
+dependencies = sqlite3

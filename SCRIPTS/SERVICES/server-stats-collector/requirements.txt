@@ -1,0 +1,5 @@
+# requirements.txt for server-stats-collector
+# Note: psutil and xxhash are NOT used by this collector script itself.
+# They are required by the companion remote daemon that runs on the
+# monitored server and sends stats to this collector.
+# If you are deploying only the collector, these are not needed.

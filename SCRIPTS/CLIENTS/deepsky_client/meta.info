@@ -1,0 +1,13 @@
+[script]
+name = DeepSky Self-Healing AI Client
+version = 1.0.0
+description = AI client with session persistence, self-healing, and auto work order generation via YuniScripts engine
+category = clients
+entry_point = main.py
+enabled = true
+server_type = critical
+shutdown_timeout = 60
+restart_policy = always
+watch_patterns = *.py
+ports = 0
+dependencies = aiohttp, sqlite3

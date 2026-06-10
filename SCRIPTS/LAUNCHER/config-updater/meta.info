@@ -1,0 +1,10 @@
+[script]
+name = Config Updater
+version = 1.0.0
+description = Validates and applies system config changes
+category = launcher
+entry_point = main.py
+enabled = true
+restart_policy = never
+watch_patterns = *.py, DATA/*.ini
+ports =

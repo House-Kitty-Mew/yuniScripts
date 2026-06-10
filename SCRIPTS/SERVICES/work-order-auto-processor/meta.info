@@ -1,0 +1,13 @@
+[script]
+name = Work Order Auto-Processor Daemon
+version = 1.0.0
+description = Background daemon that watches Documentation.db for pending work orders and auto-processes them. Uses rule-based auto-fix engine for simple fixes and advances the work_order_runner queue.
+category = services
+entry_point = main.py
+enabled = true
+server_type = service
+shutdown_timeout = 15
+restart_policy = always
+watch_patterns = *.py
+ports = 0
+dependencies = sqlite3

@@ -1,0 +1,11 @@
+[script]
+name = GUI Dashboard
+version = 1.0.0
+description = DearPyGui-based tabbed GUI dashboard for YuniScripts engine
+category = tools
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py
+requirements_file = requirements.txt
+ports = 

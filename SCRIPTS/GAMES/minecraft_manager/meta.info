@@ -1,0 +1,11 @@
+[script]
+name = Minecraft Server Manager
+version = 1.0.0
+description = Manage a local Minecraft server via RCON; listens for Phooks sign_requests
+category = games
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py, DATA/config.json
+requirements_file = requirements.txt
+# No direct UDP ports – communicates via Phooks (script_id=mc_manager)

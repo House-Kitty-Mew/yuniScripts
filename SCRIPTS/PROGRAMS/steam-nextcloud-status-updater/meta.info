@@ -1,0 +1,11 @@
+[script]
+name = Steam Nextcloud Status Updater
+version = 1.0.0
+description = Syncs Steam game status with Nextcloud user status
+category = programs
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py, DATA/*.ini
+requirements_file = requirements.txt
+ports =

@@ -1,0 +1,7 @@
+{
+    "logging_enabled": true,
+    "debug_echo": false,
+    "cooldown_seconds": 10.0,
+    "udp_timeout": 3.0,
+    "max_retries": 3
+}

@@ -1,0 +1,8 @@
+[script]
+name = Phooks Event Hub
+description = Central Phooks event bus for inter-script communication
+category = services
+entry_point = main.py
+enabled = true
+restart_policy = always
+ports = 25573

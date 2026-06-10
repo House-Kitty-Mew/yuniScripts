@@ -1,0 +1,5 @@
+# players.keys – per‑player encryption keys (base64)
+# Generate keys with: python3 -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"
+# Format: PlayerName=base64key
+# Example:
+# CoolPlayer123=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ

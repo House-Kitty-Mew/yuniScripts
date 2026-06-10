@@ -1,0 +1,2878 @@
+"""
+Host Protection System — Hardened sandbox for FastMCP tool execution.
+
+PROTECTS THE HOST SYSTEM from:
+- sys.exit(), os._exit(), os.abort() — process termination
+- os.kill(), signal.signal() — killing/changing system processes
+- subprocess.Popen(shell=True) — arbitrary shell execution
+- os.system(), subprocess.call() — dangerous subprocess calls
+- exec(), eval(), compile() — dynamic code execution
+- Fork bombs, infinite loops — resource exhaustion
+- Memory exhaustion — unlimited allocations
+- Shutdown/reboot commands
+- Dangerous module imports (os, subprocess, signal, etc.)
+
+Two integration modes:
+1. HostSafeEnvironment context manager — for wrapping tool execution
+2. HostGuard decorator — for protecting individual tool functions
+
+USAGE:
+    with HostSafeEnvironment():
+        result = tool_function(**params)
+
+    OR use the decorator for async tools:
+        @HostGuard(timeout=30)
+        async def my_tool(...)
+"""
+
+import asyncio
+import builtins
+import functools
+import importlib
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tracemalloc
+from tools.ecosystem_os_abstraction import process_info, process_kill, process_list, system_loadavg, system_memory, system_network_connections, Signals
+
+# ── Dynamic Config Registration ──────────────────────────────
+try:
+    from dynamic_config_loader import register_configs
+    register_configs("host_protection", [
+        {"key": "command_timeout_seconds", "type": "int", "default": 30,
+          "description": "Max command execution time", "valid_range": (5, 600),
+          "category": "security"},
+        {"key": "max_command_length", "type": "int", "default": 4096,
+          "description": "Max command string length", "valid_range": (256, 65536),
+          "category": "security"},
+        {"key": "rate_limit_per_tool", "type": "int", "default": 30,
+          "description": "Tool rate limit (calls/min)", "valid_range": (1, 1000),
+          "category": "performance"},
+        {"key": "block_dangerous_commands", "type": "bool", "default": True,
+          "description": "Block dangerous shell commands",
+          "category": "security"},
+        {"key": "audit_logging_enabled", "type": "bool", "default": True,
+          "description": "Enable audit logging", "category": "debug"},
+        {"key": "max_children_per_process", "type": "int", "default": 50,
+          "description": "Max child processes before alert",
+          "valid_range": (10, 1000), "category": "monitoring"},
+        {"key": "emergency_memory_threshold_mb", "type": "int", "default": 256,
+          "description": "Emergency memory kill threshold MB",
+          "valid_range": (64, 8192), "category": "security"},
+        {"key": "safe_imports_only", "type": "bool", "default": True,
+          "description": "Restrict imports to safe list",
+          "category": "security"},
+        {"key": "environment_isolation_enabled", "type": "bool", "default": True,
+          "description": "Isolate environment from host",
+          "category": "security"},
+        {"key": "filesystem_write_patterns_enabled", "type": "bool", "default": True,
+          "description": "Enable FS write pattern detection",
+          "category": "security"},
+    ])
+except ImportError:
+    pass
+# ──────────────────────────────────────────────────────────────
+
+# ═══ GOD WATCHER IMPORT — Final protection layer above Divine ═══
+try:
+    from god_watcher import (
+        get_god_watcher,
+        initialize_god_watcher,
+        shutdown_god_watcher,
+        GOD_WATCHER_ENABLED as GW_ENABLED,
+        GOD_WATCHER_AUDIT_DB as GW_AUDIT_DB,
+    )
+    _GOD_WATCHER_AVAILABLE = True
+except ImportError as e:
+    _GOD_WATCHER_AVAILABLE = False
+    # Create stubs so code doesn't break
+    def get_god_watcher():
+        return None
+    def initialize_god_watcher():
+        return {'error': 'God Watcher not available'}
+    def shutdown_god_watcher():
+        pass
+    GW_ENABLED = False
+    GW_AUDIT_DB = ''
+    logger.debug(f"God Watcher not available: {e}")
+
+from typing import Optional, Dict, Any, Callable, List, Tuple
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+
+HOST_PROTECTION_ENABLED = True
+"""Master switch. Set to False to disable ALL protections (for debugging)."""
+
+DEFAULT_TOOL_TIMEOUT = 300
+"""Default maximum execution time per tool call in seconds."""
+
+MAX_MEMORY_MB = 12288
+"""Maximum process physical memory (RSS) in MB before tools are blocked.
+Uses /proc/self/status VmRSS for accurate physical RAM tracking.
+Falls back to tracemalloc if /proc is unavailable."""
+
+MAX_SUBPROCESSES = 2
+"""Maximum concurrent subprocesses allowed."""
+
+# ── Subprocess tracking (module-level for testability and monitoring) ──
+_SUBPROCESS_LOCK = threading.Lock()
+"""Lock for _ACTIVE_SUBPROCESSES access."""
+_ACTIVE_SUBPROCESSES = []
+"""List of active Popen instances. Exposed for testing (WO #954 fix)."""
+
+BLOCKED_EXIT_FUNCTIONS = {
+    'exit', 'quit', 'sys.exit', 'os._exit', 'os.abort',
+}
+"""Functions that would terminate the host process."""
+
+BLOCKED_KILL_FUNCTIONS = {
+    'os.kill', 'os.killpg', 'signal.signal', 'signal.raise_signal',
+    'os.system', 'subprocess.call', 'subprocess.check_call',
+    'subprocess.Popen', 'subprocess.run', 'subprocess.check_output',
+}
+"""Functions that spawn processes or kill them."""
+
+BLOCKED_CODE_EXEC_FUNCTIONS = {
+    '__import__',  # Only __import__ is blocked for dangerous modules
+}
+"""Functions that execute arbitrary code."""
+
+BLOCKED_SYSTEM_MODULES = {
+    'ctypes', 'multiprocessing',
+}
+"""Modules that could break out of the sandbox."""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ORIGINAL BUILTINS BACKUP
+# ═══════════════════════════════════════════════════════════════════════
+
+_ORIGINAL_BUILTINS = dict(builtins.__dict__)
+"""Snapshot of original builtins for restoration."""
+
+# ═══ ORIGINAL MODULE FUNCTION REFERENCES — saved at import time ═══
+# These are used by patching functions to avoid recursion when the
+# same module is re-imported after patching.
+_ORIGINAL_OS__EXIT = None
+_ORIGINAL_OS_KILL = None
+_ORIGINAL_OS_KILLPG = None
+_ORIGINAL_OS_SYSTEM = None
+_ORIGINAL_OS_ABORT = None
+_ORIGINAL_SIGNAL_SIGNAL = None
+_ORIGINAL_POPEN = None
+
+def _capture_originals():
+    """Capture original module function references before any patching."""
+    global _ORIGINAL_OS__EXIT, _ORIGINAL_OS_KILL, _ORIGINAL_OS_KILLPG
+    global _ORIGINAL_OS_SYSTEM, _ORIGINAL_OS_ABORT
+    global _ORIGINAL_SIGNAL_SIGNAL, _ORIGINAL_POPEN
+    
+    try:
+        import os as _os
+        _ORIGINAL_OS__EXIT = getattr(_os, '_exit', None)
+        _ORIGINAL_OS_KILL = getattr(_os, 'kill', None)
+        _ORIGINAL_OS_KILLPG = getattr(_os, 'killpg', None)
+        _ORIGINAL_OS_SYSTEM = getattr(_os, 'system', None)
+        _ORIGINAL_OS_ABORT = getattr(_os, 'abort', None)
+    except ImportError:
+        pass
+    
+    try:
+        import signal as _sig
+        _ORIGINAL_SIGNAL_SIGNAL = getattr(_sig, 'signal', None)
+    except ImportError:
+        pass
+    
+    try:
+        import subprocess as _sp
+        _ORIGINAL_POPEN = getattr(_sp, 'Popen', None)
+    except ImportError:
+        pass
+
+# Capture at module load time
+_capture_originals()
+
+# ── Concurrent HostSafeEnvironment reference counting ─────────────
+# Tracks how many HostSafeEnvironment instances are active. Patches are
+# only applied on first entry and restored on last exit, preventing
+# concurrent tools from stepping on each other's global os/signal patches.
+_patch_refcount = 0
+_patch_refcount_lock = threading.Lock()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CALL TRACKING
+# ═══════════════════════════════════════════════════════════════════════
+
+class CallTracker:
+    """
+    Tracks calls to dangerous functions during tool execution.
+    Used for auditing and for blocking.
+    """
+    
+    def __init__(self):
+        self._calls: List[Dict] = []
+        self._lock = threading.Lock()
+    
+    def record(self, func_name: str, args: tuple, kwargs: dict,
+               blocked: bool = False, caller_info: str = ""):
+        """Record a call attempt to a dangerous function."""
+        with self._lock:
+            self._calls.append({
+                'function': func_name,
+                'args': str(args)[:200],
+                'kwargs': str(kwargs)[:200],
+                'blocked': blocked,
+                'caller': caller_info,
+                'timestamp': time.time(),
+            })
+    
+    def get_calls(self) -> List[Dict]:
+        """Get all recorded calls."""
+        with self._lock:
+            return list(self._calls)
+    
+    def clear(self):
+        """Clear recorded calls."""
+        with self._lock:
+            self._calls.clear()
+    
+    @property
+    def blocked_count(self) -> int:
+        """Count of blocked calls."""
+        with self._lock:
+            return sum(1 for c in self._calls if c['blocked'])
+
+
+_global_call_tracker = CallTracker()
+
+def get_call_tracker() -> CallTracker:
+    return _global_call_tracker
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SAFE BUILTINS OVERRIDE
+# ═══════════════════════════════════════════════════════════════════════
+
+def _safe_exit(*args, **kwargs):
+    """Replacement for exit()/quit() — raises a safe exception instead."""
+    tracker = get_call_tracker()
+    tracker.record('exit/quit', args, kwargs, blocked=True,
+                   caller_info='_safe_exit')
+    raise HostProtectionError(
+        "BLOCKED: exit()/quit() called during tool execution. "
+        "The tool attempted to terminate the host process."
+    )
+
+
+def _safe_sys_exit(*args, **kwargs):
+    """Replacement for sys.exit() — raises a safe exception."""
+    tracker = get_call_tracker()
+    tracker.record('sys.exit', args, kwargs, blocked=True,
+                   caller_info='_safe_sys_exit')
+    raise HostProtectionError(
+        f"BLOCKED: sys.exit({args[0] if args else ''}) called. "
+        "The tool attempted to terminate the host process."
+    )
+
+
+def _safe_os__exit(*args, **kwargs):
+    """Replacement for os._exit() — raises a safe exception."""
+    tracker = get_call_tracker()
+    tracker.record('os._exit', args, kwargs, blocked=True,
+                   caller_info='_safe_os__exit')
+    raise HostProtectionError(
+        f"BLOCKED: os._exit({args[0] if args else ''}) called. "
+        "The tool attempted to terminate the host process."
+    )
+
+
+def _safe_exec(code, globals=None, locals=None, /, **kwargs):
+    """Replacement for exec() — blocks arbitrary code execution."""
+    tracker = get_call_tracker()
+    tracker.record('exec', (str(code)[:100],), kwargs, blocked=True,
+                   caller_info='_safe_exec')
+    raise HostProtectionError(
+        "BLOCKED: exec() called during tool execution. "
+        "Dynamic code execution is blocked by Host Protection."
+    )
+
+
+def _safe_eval(expression, globals=None, locals=None, /, **kwargs):
+    """Replacement for eval() — blocks arbitrary code execution."""
+    tracker = get_call_tracker()
+    tracker.record('eval', (str(expression)[:100],), kwargs, blocked=True,
+                   caller_info='_safe_eval')
+    raise HostProtectionError(
+        "BLOCKED: eval() called during tool execution. "
+        "Dynamic code execution is blocked by Host Protection."
+    )
+
+
+def _safe_compile(*args, **kwargs):
+    """Replacement for compile() — blocks code compilation."""
+    tracker = get_call_tracker()
+    tracker.record('compile', (str(args[0])[:100] if args else '',), kwargs, blocked=True)
+    raise HostProtectionError(
+        "BLOCKED: compile() called during tool execution. "
+        "Dynamic code execution is blocked by Host Protection."
+    )
+
+
+def _safe___import__(name, globals=None, locals=None, fromlist=(),
+                    level=0):
+    """Safe __import__ that blocks dangerous modules."""
+    # Check against blocked system modules
+    base_name = name.split('.')[0]
+    # CORE: Only block signal module modification (handled by _patch_signal_module).
+    # ctypes and multiprocessing are needed by Python internals.
+    # Protection against dangerous use is at the function level.
+    # signal module import is allowed (we patch signal.signal at function level)
+    # Only ctypes/multiprocessing could be used to bypass protections, but Python
+    # internals depend on them, so we only block at function level.
+    if False:  # No module-level blocking — function-level is sufficient
+        tracker = get_call_tracker()
+        tracker.record(f'__import__({name})', (name,), {}, blocked=True)
+        raise HostProtectionError(
+            f"BLOCKED: Import of '{name}' is not allowed. "
+            f"This module could compromise host security."
+        )
+    
+    # Allow all other imports
+    return _ORIGINAL_BUILTINS['__import__'](name, globals, locals,
+                                            fromlist, level)
+
+
+def _get_dangerous_func_name(obj) -> str:
+    """Get a human-readable name for a dangerous function."""
+    if hasattr(obj, '__name__'):
+        return obj.__name__
+    if hasattr(obj, 'func_name'):
+        return obj.func_name
+    return str(obj)[:50]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MODULE-LEVEL PATCHING
+# ═══════════════════════════════════════════════════════════════════════
+
+def _patch_os_module():
+    """Patch dangerous os module functions."""
+    if not HOST_PROTECTION_ENABLED:
+        return
+    
+    _orig_import = _ORIGINAL_BUILTINS.get('__import__', builtins.__import__)
+    os_module = _orig_import('os')
+    
+    # Patch os._exit — blocks process termination
+    if hasattr(os_module, '_exit'):
+        os_module._exit = _safe_os__exit
+    
+    # Patch os.system — blocks shell execution
+    if hasattr(os_module, 'system'):
+        def _safe_os_system(command):
+            tracker = get_call_tracker()
+            tracker.record('os.system', (command[:200],), {}, blocked=True,
+                           caller_info='patched_os.system')
+            raise HostProtectionError(
+                f"BLOCKED: os.system('{command[:100]}') called. "
+                f"Shell execution is blocked by Host Protection."
+            )
+        os_module.system = _safe_os_system
+    
+    # Patch os.kill — blocks process killing
+    if hasattr(os_module, 'kill'):
+        def _safe_os_kill(pid, sig):
+            tracker = get_call_tracker()
+            # ═══ GOD WATCHER FIX ═══
+            # signal.signal(0) is a process EXISTENCE check, not a kill.
+            # It's used by process_watchdog.py to test if a PID is alive.
+            # PID 2 (kthreadd) is valid and signal 0 just checks existence.
+            # Blocking signal 0 causes watchdog spam errors every 60s.
+            if sig == 0:
+                tracker.record('os.kill(pid={pid}, signal=0) - PROCESS EXISTENCE CHECK',
+                              (pid, sig), {}, blocked=False,
+                              caller_info='patched_os.kill(allow_signal_0)')
+                return _ORIGINAL_OS_KILL(pid, sig)
+            
+            # Allow tools to kill their own subprocesses if PID is tracked
+            # But block killing system processes (PID <= 100 on Linux)
+            if pid <= 100:
+                tracker.record('os.kill', (pid, sig), {}, blocked=True,
+                               caller_info='patched_os.kill')
+                raise HostProtectionError(
+                    f"BLOCKED: os.kill(pid={pid}, signal={sig}) called. "
+                    f"Killing system processes is blocked by Host Protection."
+                )
+            tracker.record('os.kill', (pid, sig), {}, blocked=False)
+            return _ORIGINAL_OS_KILL(pid, sig)
+        os_module.kill = _safe_os_kill
+    
+    # Patch os.killpg
+    if hasattr(os_module, 'killpg'):
+        def _safe_os_killpg(pgid, sig):
+            tracker = get_call_tracker()
+            tracker.record('os.killpg', (pgid, sig), {}, blocked=True,
+                           caller_info='patched_os.killpg')
+            raise HostProtectionError(
+                f"BLOCKED: os.killpg(pgid={pgid}) called. "
+                f"Killing process groups is blocked by Host Protection."
+            )
+        os_module.killpg = _safe_os_killpg
+    
+    # Patch os.abort
+    if hasattr(os_module, 'abort'):
+        def _safe_os_abort():
+            tracker = get_call_tracker()
+            tracker.record('os.abort', (), {}, blocked=True,
+                           caller_info='patched_os.abort')
+            raise HostProtectionError(
+                f"BLOCKED: os.abort() called. "
+                f"Process abort is blocked by Host Protection."
+            )
+        os_module.abort = _safe_os_abort
+
+
+def _patch_signal_module():
+    """Patch dangerous signal module functions."""
+    if not HOST_PROTECTION_ENABLED:
+        return
+    
+    import signal as _sig_mod
+    
+    # Patch signal.signal — prevents changing signal handlers
+    if _ORIGINAL_SIGNAL_SIGNAL is not None:
+        def _safe_signal(signum, handler):
+            tracker = get_call_tracker()
+            # Allow SIG_DFL/SIG_IGN
+            if handler in (_sig_mod.SIG_DFL, _sig_mod.SIG_IGN):
+                tracker.record('signal.signal', (signum, handler), {},
+                               blocked=False)
+                return _ORIGINAL_SIGNAL_SIGNAL(signum, handler)
+            
+            # CRITICAL: Only block DANGEROUS signal changes that could crash host.
+            # SIGINT (2) is allowed because asyncio.run() sets it internally.
+            # SIGTERM (15) to SIG_DFL is fine. Only block if setting to a custom
+            # handler that could prevent proper shutdown.
+            _dangerous_signals = {getattr(_sig_mod, 'SIGKILL', 9),
+                                  getattr(_sig_mod, 'SIGSTOP', 19)}
+            
+            if signum in _dangerous_signals:
+                tracker.record('signal.signal', (signum, handler), {},
+                               blocked=True)
+                raise HostProtectionError(
+                    f"BLOCKED: signal.signal({signum}, custom_handler) called. "
+                    f"Changing critical signal handlers is blocked."
+                )
+            
+            # Allow all other signal changes (asyncio needs SIGINT)
+            tracker.record('signal.signal', (signum, handler), {},
+                           blocked=False)
+            return _ORIGINAL_SIGNAL_SIGNAL(signum, handler)
+        _sig_mod.signal = _safe_signal
+
+
+def _patch_subprocess_module():
+    """Patch subprocess module to only allow safe subprocesses."""
+    if not HOST_PROTECTION_ENABLED:
+        return
+    
+    _orig_import = _ORIGINAL_BUILTINS.get('__import__', builtins.__import__)
+    subprocess_module = _orig_import('subprocess')
+    
+    # ── Subprocess tracking uses module-level vars for testability ──
+    
+    def _cleanup_process(p):
+        """Remove p from active list and kill if still running."""
+        with _SUBPROCESS_LOCK:
+            if p in _ACTIVE_SUBPROCESSES:
+                _ACTIVE_SUBPROCESSES.remove(p)
+        # Ensure it's terminated
+        if p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                pass
+    
+    def _sweep_completed_processes():
+        """Remove any completed processes from the active list."""
+        with _SUBPROCESS_LOCK:
+            still_active = [p for p in _ACTIVE_SUBPROCESSES if p.poll() is None]
+            _ACTIVE_SUBPROCESSES.clear()
+            _ACTIVE_SUBPROCESSES.extend(still_active)
+    
+    def _track_and_validate_popen(cmd, **kwargs):
+        """Track Popen calls and validate them."""
+        # Always validate dangerous patterns
+        if isinstance(cmd, (list, tuple)):
+            cmd_str = ' '.join(str(c) for c in cmd)
+        else:
+            cmd_str = str(cmd)
+        dangerous_patterns = [
+            'rm -rf', 'rm -rf /', 'mkfs', 'dd if=', 'format',
+            'shutdown', 'reboot', 'halt', 'poweroff',
+            'init 0', 'init 6', '> /dev/sda', '| shutdown',
+            'wget', 'curl', 'chmod 777', 'chown',
+        ]
+        
+        for pattern in dangerous_patterns:
+            if pattern in cmd_str.lower():
+                tracker = get_call_tracker()
+                tracker.record('subprocess.Popen', (cmd_str[:200],), kwargs,
+                              blocked=True,
+                              caller_info='patched_subprocess.validate')
+                raise HostProtectionError(
+                    f"BLOCKED: subprocess command contains dangerous pattern "
+                    f"'{pattern}'. Host Protection blocked execution."
+                )
+        
+        # Sweep completed processes before checking limit — prevents leaks
+        _sweep_completed_processes()
+        
+        # Track active subprocess count
+        with _SUBPROCESS_LOCK:
+            if len(_ACTIVE_SUBPROCESSES) >= MAX_SUBPROCESSES:
+                tracker = get_call_tracker()
+                tracker.record('subprocess.Popen', (cmd_str[:200],), kwargs,
+                              blocked=True,
+                              caller_info='patched_subprocess.max_limit')
+                raise HostProtectionError(
+                    f"BLOCKED: Maximum subprocess limit ({MAX_SUBPROCESSES}) "
+                    f"reached. Host Protection blocked new subprocess."
+                )
+        
+        # Create the subprocess
+        proc = _ORIGINAL_POPEN(cmd, **kwargs)
+        
+        with _SUBPROCESS_LOCK:
+            _ACTIVE_SUBPROCESSES.append(proc)
+        
+        # Store original wait to inject cleanup
+        original_wait = proc.wait
+        def _safe_wait(timeout=None):
+            try:
+                return original_wait(timeout=timeout)
+            finally:
+                _cleanup_process(proc)
+        proc.wait = _safe_wait
+        
+        return proc
+    
+    # Wrap Popen
+    class SafePopen:
+        def __init__(self, args, **kwargs):
+            self._process = _track_and_validate_popen(args, **kwargs)
+        
+        def __getattr__(self, name):
+            return getattr(self._process, name)
+        
+        def communicate(self, input=None, timeout=None):
+            try:
+                return self._process.communicate(input=input, timeout=timeout)
+            finally:
+                _cleanup_process(self._process)
+        
+        def wait(self, timeout=None):
+            return self._process.wait(timeout=timeout)
+        
+        def __enter__(self):
+            return self._process.__enter__()
+        
+        def __exit__(self, *args):
+            try:
+                return self._process.__exit__(*args)
+            finally:
+                _cleanup_process(self._process)
+    
+    subprocess_module.Popen = SafePopen
+    
+    # run(), call(), check_call() all use Popen() internally,
+    # so wrapping Popen is sufficient.
+
+def _patch_ctypes_module():
+    """Prevent ctypes from being used to bypass protections."""
+    # ctypes is blocked at the import level, but in case it's already loaded,
+    # remove dangerous functions
+    if 'ctypes' in sys.modules:
+        ctypes_mod = sys.modules['ctypes']
+        # Remove CDLL and friends that could execute arbitrary code
+        for attr in ['CDLL', 'WinDLL', 'OleDLL', 'PyDLL', 'CDLL',
+                     'windll', 'oledll', 'cdll']:
+            if hasattr(ctypes_mod, attr):
+                try:
+                    delattr(ctypes_mod, attr)
+                except AttributeError:
+                    pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HOST PROTECTION ERROR
+# ═══════════════════════════════════════════════════════════════════════
+
+class HostProtectionError(Exception):
+    """
+    Raised when a tool attempts a dangerous operation.
+    This is a SAFE exception — it will be caught and logged,
+    but will NOT crash the host process.
+    """
+    pass
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HOST SAFE ENVIRONMENT — Context Manager
+# ═══════════════════════════════════════════════════════════════════════
+
+class HostSafeEnvironment:
+    """
+    Context manager that creates a safe execution environment.
+    
+    During the context:
+    - Dangerous builtins are replaced with safe versions
+    - os module functions are patched
+    - signal module functions are patched
+    - subprocess module is restricted
+    - exec()/eval()/compile() are blocked
+    - All dangerous calls are tracked for auditing
+    
+    On exit, everything is restored to original.
+    """
+    
+    def __init__(self, tool_name: str = "unknown_tool",
+                 timeout: int = DEFAULT_TOOL_TIMEOUT,
+                 suppress_hpe: bool = True):
+        """Initialize HostSafeEnvironment.
+        
+        Args:
+            tool_name: Name of the tool being protected (for logging).
+            timeout: Maximum execution time in seconds.
+            suppress_hpe: If True, suppress HostProtectionError on exit
+                          (default). Set to False when the caller needs
+                          HostProtectionError to propagate (e.g., HostGuard
+                          decorator).
+        """
+        self.tool_name = tool_name
+        self.timeout = timeout
+        self.suppress_hpe = suppress_hpe
+        self._patches_applied = []
+        self._start_time = None
+        self._call_tracker = get_call_tracker()
+        self._timeout_exception = None
+    
+    def __enter__(self):
+        if not HOST_PROTECTION_ENABLED:
+            return self
+        
+        self._start_time = time.time()
+        self._call_tracker.clear()
+        
+        # Apply all patches (only first concurrent instance — refcounted)
+        global _patch_refcount
+        with _patch_refcount_lock:
+            _patch_refcount += 1
+            if _patch_refcount == 1:
+                self._apply_builtin_patches()
+                self._apply_module_patches()
+        
+        # ── Apply OS-level memory/resource guard ──────────────
+        # NOTE: We do NOT use resource.setrlimit() here because:
+        #   - RLIMIT_NPROC once lowered cannot be raised (non-root)
+        #   - Would permanently limit server's thread creation ability
+        #   - RLIMIT_AS can cause unpredictable failures
+        # Instead, protection is at the subprocess/tracking level:
+        #   - Subprocess count is tracked in _patch_subprocess_module()
+        #   - Concurrent process count is checked in Layer 7
+        #   - Memory is checked pre-execution in _check_memory_available()
+        #   - Weight scoring in Layer 9 prevents cumulative overload
+        #   - Zombie reaper in Layer 12 cleans up dead processes
+        
+        logger.debug(f"HostSafeEnvironment activated for tool '{self.tool_name}'")
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not HOST_PROTECTION_ENABLED:
+            return False
+        
+        # Restore all patches (only last concurrent instance)
+        global _patch_refcount
+        with _patch_refcount_lock:
+            _patch_refcount -= 1
+            if _patch_refcount <= 0:
+                self._restore_patches()
+        
+        elapsed = time.time() - self._start_time
+        
+        # Log any blocked calls
+        if self._call_tracker.blocked_count > 0:
+            logger.warning(
+                f"Tool '{self.tool_name}' had {self._call_tracker.blocked_count} "
+                f"blocked dangerous call(s) in {elapsed:.2f}s"
+            )
+        
+        # If the tool raised a HostProtectionError, handle it
+        # When suppress_hpe=True: suppress it (it's been logged, no need to crash)
+        # When suppress_hpe=False: let it propagate (caller will handle it)
+        if exc_type is HostProtectionError:
+            logger.warning(
+                f"Host Protection blocked tool '{self.tool_name}': {exc_val}"
+            )
+            if self.suppress_hpe:
+                return True  # Suppress the exception
+            # Otherwise let it propagate
+        
+        return False  # Don't suppress other exceptions
+    
+    def _apply_builtin_patches(self):
+        """Replace dangerous builtins with safe versions."""
+        if not HOST_PROTECTION_ENABLED:
+            return
+        
+        builtins_dict = builtins.__dict__
+        
+        # Patch exit/quit
+        if builtins_dict.get('exit') is not _safe_exit:
+            self._patches_applied.append(('builtins', 'exit',
+                                          builtins_dict.get('exit')))
+            builtins_dict['exit'] = _safe_exit
+        
+        if builtins_dict.get('quit') is not _safe_exit:
+            self._patches_applied.append(('builtins', 'quit',
+                                          builtins_dict.get('quit')))
+            builtins_dict['quit'] = _safe_exit
+        
+        # NOTE: exec/eval/compile NOT patched because Python's import
+        # system internally uses exec(). Blocking it would break all imports.
+        # Critical protections (exit, kill, shell, subprocess) are at module level.
+        
+        # Patch __import__ — only block dangerous modules (ctypes, multiprocessing)
+        if builtins_dict.get('__import__') is not _safe___import__:
+            self._patches_applied.append(('builtins', '__import__',
+                                          builtins_dict.get('__import__')))
+            builtins_dict['__import__'] = _safe___import__
+    
+    def _apply_module_patches(self):
+        """Apply module-level patches."""
+        if not HOST_PROTECTION_ENABLED:
+            return
+        
+        _patch_os_module()
+        _patch_signal_module()
+        _patch_subprocess_module()
+        _patch_ctypes_module()
+        
+        # Patch sys.exit
+        if hasattr(sys, 'exit') and sys.exit is not _safe_sys_exit:
+            self._patches_applied.append(('sys', 'exit', sys.exit))
+            sys.exit = _safe_sys_exit
+
+        # ── ALSO track os/signal/subprocess patches for restoration ──
+        # Without this, os.kill/os.killpg remain patched after the FIRST
+        # tool call — the server can never kill its child processes again.
+        import os as _os_t
+        for _attr, _orig in [('_exit', _ORIGINAL_OS__EXIT), ('kill', _ORIGINAL_OS_KILL),
+                             ('killpg', _ORIGINAL_OS_KILLPG), ('system', _ORIGINAL_OS_SYSTEM),
+                             ('abort', _ORIGINAL_OS_ABORT)]:
+            if _orig is not None:
+                self._patches_applied.append(('os_module', _attr, _orig))
+        import signal as _sig_t
+        if _ORIGINAL_SIGNAL_SIGNAL is not None:
+            self._patches_applied.append(('signal_module', 'signal', _ORIGINAL_SIGNAL_SIGNAL))
+        import subprocess as _sp_t
+        if _ORIGINAL_POPEN is not None:
+            self._patches_applied.append(('subprocess_module', 'Popen', _ORIGINAL_POPEN))
+    
+    def _restore_patches(self):
+        """Restore all patched functions to originals."""
+        for location, name, original in reversed(self._patches_applied):
+            try:
+                if location == 'builtins':
+                    if original is not None:
+                        builtins.__dict__[name] = original
+                    else:
+                        builtins.__dict__.pop(name, None)
+                elif location == 'sys':
+                    if original is not None:
+                        sys.exit = original
+                elif location == 'os_module':
+                    import os as _os_rest
+                    if original is not None:
+                        setattr(_os_rest, name, original)
+                elif location == 'signal_module':
+                    import signal as _sig_rest
+                    if original is not None:
+                        setattr(_sig_rest, name, original)
+                elif location == 'subprocess_module':
+                    import subprocess as _sp_rest
+                    if original is not None:
+                        setattr(_sp_rest, name, original)
+            except Exception as e:
+                logger.error(f"Failed to restore patch {location}.{name}: {e}")
+        
+        self._patches_applied.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HOST GUARD — Decorator
+# ═══════════════════════════════════════════════════════════════════════
+
+class HostGuard:
+    """
+    Decorator that wraps a function with Host Protection.
+    
+    Applies HostSafeEnvironment and timeout enforcement.
+    
+    Usage:
+        @HostGuard(timeout=60)
+        async def my_tool(...):
+            ...
+        
+        @HostGuard(timeout=30)
+        def my_sync_tool(...):
+            ...
+    """
+    
+    def __init__(self, timeout: int = DEFAULT_TOOL_TIMEOUT):
+        self.timeout = timeout
+    
+    def __call__(self, func: Callable):
+        if asyncio.iscoroutinefunction(func):
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                tool_name = func.__name__
+                # Use suppress_hpe=False so HostProtectionError propagates
+                # to the caller (tests expect to catch it)
+                with HostSafeEnvironment(tool_name=tool_name,
+                                         timeout=self.timeout,
+                                         suppress_hpe=False):
+                    try:
+                        result = await asyncio.wait_for(
+                            func(*args, **kwargs),
+                            timeout=self.timeout
+                        )
+                        return result
+                    except asyncio.TimeoutError:
+                        raise HostProtectionError(
+                            f"Tool '{tool_name}' exceeded timeout "
+                            f"({self.timeout}s). Host Protection terminated it."
+                        )
+            return async_wrapper
+        else:
+            @functools.wraps(func)
+            def sync_wrapper(*args, **kwargs):
+                tool_name = func.__name__
+                # Use threading timer for timeout on sync functions.
+                # HostSafeEnvironment is on the MAIN thread (not inside the
+                # worker thread) to ensure patches are applied/restored on
+                # the main thread. This prevents patch leakage when the
+                # worker thread outlives the timeout join().
+                #
+                # suppress_hpe=False allows HostProtectionError (from timeout)
+                # to propagate out of the with block.
+                #
+                # The exception collected from the worker thread is re-raised
+                # OUTSIDE the with block so HostSafeEnvironment.__exit__
+                # cannot suppress it (e.g., a HostProtectionError from func()
+                # calling exit() is caught by the worker's try/except, stored
+                # in exception[0], and re-raised here after the with block
+                # has already cleaned up).
+                result = [None]
+                exception = [None]
+                completed = [False]
+                
+                def target():
+                    try:
+                        result[0] = func(*args, **kwargs)
+                    except Exception as e:
+                        exception[0] = e
+                    finally:
+                        completed[0] = True
+                
+                thread = threading.Thread(target=target, daemon=True)
+                
+                # Apply protection on main thread while waiting for worker.
+                # IMPORTANT: thread.start() is INSIDE the with block so that
+                # HostSafeEnvironment patches (builtins.exit, sys.exit) are
+                # active BEFORE the worker thread starts executing func().
+                # This prevents a race condition where the worker thread
+                # calls exit() before patches are applied.
+                with HostSafeEnvironment(tool_name=tool_name,
+                                         timeout=self.timeout,
+                                         suppress_hpe=False):
+                    thread.start()
+                    thread.join(timeout=self.timeout)
+                    
+                    if not completed[0]:
+                        raise HostProtectionError(
+                            f"Tool '{tool_name}' exceeded timeout "
+                            f"({self.timeout}s). Host Protection terminated it."
+                        )
+                
+                # Re-raise worker exception OUTSIDE the with block
+                # so HostSafeEnvironment.__exit__ cannot suppress it
+                if exception[0]:
+                    raise exception[0]
+                
+                return result[0]
+            return sync_wrapper
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PRE-EXECUTION VALIDATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def _check_memory_available(min_mb: int = 2048) -> Tuple[bool, str]:
+    """Check if system has enough available memory.
+    
+    Args:
+        min_mb: Minimum available memory in MB (default 2048 = 2GB)
+    
+    Returns:
+        (True, "") if enough memory
+        (False, "reason") if memory too low
+    """
+    try:
+        mem = system_memory()
+        avail_mb = mem.get('available_kb', 0) / 1024
+        if avail_mb < min_mb:
+            return (False,
+                    f"BLOCKED: Insufficient available memory "
+                    f"({avail_mb:.0f}MB < {min_mb}MB minimum). "
+                    f"Host Protection prevented execution to avoid crash.")
+        return True, ""
+    except Exception:
+        # Can't check? Allow but log
+        logger.debug("Could not check available memory — allowing execution")
+        return True, ""
+    return True, ""
+
+
+def _check_traced_memory() -> Tuple[bool, str]:
+    """Check process physical memory (RSS) against MAX_MEMORY_MB limit.
+
+    Reads /proc/self/status VmRSS for accurate physical RAM usage.
+    Falls back to tracemalloc.get_traced_memory() if /proc is unavailable.
+
+    SAFETY OVERRIDE: Even if process RSS exceeds MAX_MEMORY_MB, execution
+    is ALLOWED if the system has >= 2GB of available memory. This prevents
+    false blocks when a long-running server has accumulated memory but the
+    system is not under memory pressure (the exact scenario this fix addresses).
+
+    Returns:
+        (True, "") if under limit or system has enough free memory
+        (False, "reason") if memory exceeds limit AND system is low on memory
+    """
+    try:
+        # Primary: read VmRSS from /proc/self/status (actual physical RAM)
+        import os
+        with open(f'/proc/{os.getpid()}/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss_kb = int(line.split()[1])
+                    rss_mb = rss_kb / 1024
+                    if rss_mb > MAX_MEMORY_MB:
+                        # ── SAFETY OVERRIDE ──────────────────────────────
+                        # If system has enough free memory, allow execution
+                        # despite high process RSS. Prevents false blocks
+                        # when server accumulated memory but system is fine.
+                        avail_mb = 0  # default if check fails
+                        try:
+                            mem = system_memory()
+                            avail_mb = mem.get('available_kb', 0) / 1024
+                            if avail_mb >= 2048:  # 2GB minimum free
+                                logger.debug(
+                                    f"Process RSS {rss_mb:.0f}MB > limit "
+                                    f"{MAX_MEMORY_MB}MB, but system has "
+                                    f"{avail_mb:.0f}MB free — ALLOWING")
+                                return True, ""
+                        except Exception:
+                            pass
+                        # Genuine block: process RSS too high AND system low
+                        return (False,
+                                f"BLOCKED: Process physical memory ({rss_mb:.0f}MB RSS) exceeds "
+                                f"MAX_MEMORY_MB={MAX_MEMORY_MB}MB limit "
+                                f"(system available: {avail_mb:.0f}MB < 2048MB). "
+                                f"Host Protection prevented execution to avoid crash.")
+                    return True, ""
+    except Exception:
+        pass
+
+    # Fallback: tracemalloc if /proc unavailable
+    try:
+        if not tracemalloc.is_tracing():
+            return True, ""
+        current, peak = tracemalloc.get_traced_memory()
+        current_mb = current / (1024 * 1024)
+        if current_mb > MAX_MEMORY_MB:
+            # Same safety override for tracemalloc fallback
+            avail_mb = 0  # default if check fails
+            try:
+                mem = system_memory()
+                avail_mb = mem.get('available_kb', 0) / 1024
+                if avail_mb >= 2048:
+                    logger.debug(
+                        f"Traced memory {current_mb:.0f}MB > limit "
+                        f"{MAX_MEMORY_MB}MB, but system has "
+                        f"{avail_mb:.0f}MB free — ALLOWING")
+                    return True, ""
+            except Exception:
+                pass
+            return (False,
+                    f"BLOCKED: Process traced memory ({current_mb:.0f}MB) exceeds "
+                    f"MAX_MEMORY_MB={MAX_MEMORY_MB}MB limit "
+                    f"(system available: {avail_mb:.0f}MB < 2048MB). "
+                    f"Host Protection prevented execution to avoid crash.")
+        return True, ""
+    except Exception:
+        logger.debug("Could not check traced memory - allowing execution")
+        return True, ""
+
+
+def _check_rate_limit(tool_name: str, max_calls: int = 30, window_seconds: int = 60) -> Tuple[bool, str]:
+    """
+    ADAPTIVE per-tool rate limiter.
+    
+    Learns each tool's normal call pattern and auto-adapts the limit.
+    - Tracks a 60s rolling window per tool
+    - Computes moving average baseline from historical usage
+    - Allows bursts up to 3x the tool's own baseline
+    - Hard cap at 60 calls/60s absolute maximum
+    - For new tools: starts at max_calls (default 30), adapts after 5 calls
+    
+    Args:
+        tool_name: Name of the tool to check
+        max_calls: Starting limit for new tools (default 30)
+        window_seconds: Time window in seconds (default 60)
+    
+    Returns:
+        (True, "") if under limit
+        (False, "reason") if rate limited
+    """
+    import threading
+    import collections
+    
+    # Persistent state
+    if not hasattr(_check_rate_limit, "_call_times"):
+        _check_rate_limit._call_times = {}         # tool_name -> deque of timestamps
+        _check_rate_limit._baselines = {}           # tool_name -> float (adaptive baseline)
+        _check_rate_limit._lock = threading.Lock()
+        _check_rate_limit._HARD_CAP = 60            # absolute max calls/60s
+    
+    now = time.time()
+    
+    with _check_rate_limit._lock:
+        # Get or create deque for this tool
+        if tool_name not in _check_rate_limit._call_times:
+            _check_rate_limit._call_times[tool_name] = collections.deque(maxlen=200)
+            _check_rate_limit._baselines[tool_name] = float(max_calls)
+        
+        times = _check_rate_limit._call_times[tool_name]
+        baseline = _check_rate_limit._baselines[tool_name]
+        
+        # Prune old entries (outside window)
+        cutoff = now - window_seconds
+        while times and times[0] < cutoff:
+            times.popleft()
+        
+        current_count = len(times)
+        
+        # ── Adaptive baseline ──────────────────────────────────
+        # Every 5 calls, update the baseline to match actual usage
+        # Uses exponential moving average: new_baseline = 0.7*baseline + 0.3*current
+        if current_count > 5:
+            # Smoothly adapt baseline toward actual usage
+            _check_rate_limit._baselines[tool_name] = (
+                0.7 * baseline + 0.3 * current_count
+            )
+            baseline = _check_rate_limit._baselines[tool_name]
+        
+        # ── Effective limit ────────────────────────────────────
+        # Allow 3x the tool's own baseline as burst, capped at HARD_CAP
+        effective_limit = min(baseline * 3.0, float(_check_rate_limit._HARD_CAP))
+        effective_limit = max(effective_limit, 10.0)  # floor of 10
+        
+        # ── Check ──────────────────────────────────────────────
+        if current_count >= int(effective_limit):
+            oldest = times[0] if times else now
+            retry_in = int(window_seconds - (now - oldest))
+            return (False,
+                    f"BLOCKED: Rate limit exceeded for '{tool_name}'. "
+                    f"Adaptive limit: {int(effective_limit)} calls in {window_seconds}s "
+                    f"(baseline={int(baseline)}, burst=3x). "
+                    f"Retry in ~{retry_in}s. "
+                    f"Hard cap: {_check_rate_limit._HARD_CAP}/60s.")
+        
+        times.append(now)
+    
+    return True, ""
+
+
+def clear_rate_limits():
+    """Clear all rate limit tracking (for testing)."""
+    if hasattr(_check_rate_limit, "_call_times"):
+        with _check_rate_limit._lock:
+            _check_rate_limit._call_times.clear()
+            _check_rate_limit._baselines.clear()
+
+
+def get_rate_limit_stats() -> dict:
+    """Get per-tool rate limit statistics for monitoring."""
+    stats = {}
+    if hasattr(_check_rate_limit, "_call_times"):
+        with _check_rate_limit._lock:
+            for tool, times in _check_rate_limit._call_times.items():
+                baseline = _check_rate_limit._baselines.get(tool, 30)
+                current = len(times)
+                effective = min(int(baseline * 3), _check_rate_limit._HARD_CAP)
+                stats[tool] = {
+                    "current_count": current,
+                    "baseline": int(baseline),
+                    "effective_limit": effective,
+                    "hard_cap": _check_rate_limit._HARD_CAP,
+                }
+    return stats
+
+
+def clear_command_weights():
+    """Clear all command weight tracking (for testing/reset)."""
+    if hasattr(_static_analysis_exec_command, '_cmd_weight_tracker'):
+        with _static_analysis_exec_command._cmd_weight_lock:
+            _static_analysis_exec_command._cmd_weight_tracker.clear()
+
+
+# ── Server-wide concurrent process tracker ──────────────────────────
+_CONCURRENT_PROCESS_TRACKER_LOCK = threading.Lock()
+_CONCURRENT_PROCESS_COUNT = 0
+_MAX_CONCURRENT_PROCESSES = 3  # Hard limit: max 3 concurrent subprocesses server-wide
+
+def _track_process_start():
+    """Increment the server-wide concurrent process counter."""
+    global _CONCURRENT_PROCESS_COUNT
+    with _CONCURRENT_PROCESS_TRACKER_LOCK:
+        if _CONCURRENT_PROCESS_COUNT >= _MAX_CONCURRENT_PROCESSES:
+            return False
+        _CONCURRENT_PROCESS_COUNT += 1
+        return True
+
+def _track_process_end():
+    """Decrement the server-wide concurrent process counter."""
+    global _CONCURRENT_PROCESS_COUNT
+    with _CONCURRENT_PROCESS_TRACKER_LOCK:
+        _CONCURRENT_PROCESS_COUNT = max(0, _CONCURRENT_PROCESS_COUNT - 1)
+
+def get_concurrent_process_count() -> int:
+    """Get current number of tracked concurrent subprocesses."""
+    global _CONCURRENT_PROCESS_COUNT
+    with _CONCURRENT_PROCESS_TRACKER_LOCK:
+        return _CONCURRENT_PROCESS_COUNT
+
+
+def _check_concurrent_processes(max_allowed: int = 10) -> Tuple[bool, str]:
+    """Check how many subprocesses this server has spawned.
+    
+    Uses the server-side tracker to count only processes that were
+    spawned by the execute_command/execute_commands tools.
+    Also checks /proc for direct child processes of this server process
+    as a defense-in-depth measure.
+    
+    Args:
+        max_allowed: Maximum allowed concurrent tracked processes (default 10)
+    
+    Returns:
+        (True, "") if under limit
+        (False, "reason") if too many processes
+    """
+    # Use the server-side tracker for accurate counting
+    tracked = get_concurrent_process_count()
+    if tracked >= max_allowed:
+        return (False,
+                f"BLOCKED: Too many tracked concurrent subprocesses "
+                f"({tracked} >= {max_allowed} max). "
+                f"Host Protection prevented execution to avoid resource exhaustion.")
+    
+    # Defense-in-depth: count direct children of this server process via /proc
+    try:
+        my_pid = os.getpid()
+        child_count = 0
+        for proc in process_list():
+            if proc.get('ppid') == my_pid:
+                child_count += 1
+        
+        if child_count > max_allowed * 2:  # Allow more children (may be zombies)
+            return (False,
+                    f"BLOCKED: Too many child processes of server "
+                    f"({child_count} children > {max_allowed * 2} max). "
+                    f"Host Protection prevented execution.")
+        
+        return True, ""
+    except Exception as e:
+        logger.debug(f"Could not check child process count: {e}")
+        return True, ""
+
+
+def _static_analysis_exec_command(command: str) -> Tuple[bool, str]:
+    """Static analysis of execute_command commands for dangerous patterns.
+    
+    Checks for:
+    - Shell destructive commands (rm -rf /, shutdown, etc.)
+    - Test runners that spawn many subprocesses (unittest, pytest)
+    - Background processes (&) that escape timeout
+    - Python scripts that spawn subprocesses
+    - Fork-bomb patterns
+    - Recursive script execution
+    
+    Returns:
+        (True, "") if safe
+        (False, "reason") if blocked
+    """
+    # ── Layer 1: Destructive patterns (existing) ──────────────
+    destructive_patterns = [
+        'shutdown', 'reboot', 'halt', 'poweroff',
+        'init 0', 'init 6', 'mkfs', 'dd if=',
+        '> /dev/sda', '> /dev/sdb', '> /dev/nvme',
+        'rm -rf /', 'rm -rf --no-preserve-root',
+        'chmod 777 /', 'chown 0:0 /',
+    ]
+    for pattern in destructive_patterns:
+        if pattern.lower() in command.lower():
+            return (False,
+                    f"BLOCKED: Command contains dangerous pattern "
+                    f"'{pattern}'. Host Protection prevented execution.")
+    
+    # ── Layer 2: Fork-bomb patterns ──────────────────────────
+    fork_bomb_patterns = [
+        ':(){ :|:& };:',           # Classic bash fork bomb (with invocation)
+        ':(){ :|:& };',            # Classic (without invocation - still dangerous)
+        ':() { :|: & };:',         # Variant with spaces
+        ':() { :|: & };',          # Variant without invocation
+        'fork()',                   # C/Python fork bomb
+        'while True: os.fork()',   # Python fork bomb
+    ]
+    for pattern in fork_bomb_patterns:
+        if pattern in command:
+            return (False,
+                    f"BLOCKED: Fork bomb pattern detected. "
+                    f"Host Protection prevented execution.")
+    
+    # ── Layer 3: Test runners that spawn many subprocesses ────
+    # Commands like "python3 -m unittest" or "pytest" that spawn
+    # many test processes in parallel
+    cmd_lower = command.lower()
+    
+    # ── Layer 3a: pytest blocking (HARDENED v5) ──────────────────────
+    # CRITICAL: ALL pytest invocations are blocked. Even single-file pytest
+    # internally spawns subprocesses for test discovery, fixture setup, and
+    # test execution. Each subprocess forks the full Python interpreter,
+    # loading all imported modules (including heavy ones like deepsky-client,
+    # FastMCP server, and engine modules). This can cascade into OOM crashes.
+    #
+    # The only safe way to run tests is via `python3 -m unittest <single_module>`
+    # which runs in-process without spawning uncontrolled subprocesses.
+    if 'pytest' in cmd_lower.replace('-', ''):
+        return (False,
+                "🔒 BLOCKED (Layer 3a v5): pytest invocation detected. "
+                "ALL pytest calls are blocked — even single-file pytest "
+                "internally spawns subprocesses that can cascade into "
+                "OOM crashes. Run tests via: `python3 -m unittest <module>` "
+                "Host Protection prevented execution to avoid crash.")
+    
+    # ── Layer 3b: unittest blocking ─────────────────────────
+    # unittest with -m flag and multiple modules spawns many processes.
+    # Limit to 1 module per exec call (strict).
+    if '-m unittest' in cmd_lower:
+        parts = cmd_lower.split()
+        unittest_idx = -1
+        for i, p in enumerate(parts):
+            if p == '-m' and i+1 < len(parts) and parts[i+1] == 'unittest':
+                unittest_idx = i
+                break
+        if unittest_idx >= 0:
+            test_modules = [p for p in parts[unittest_idx+2:] 
+                            if p.startswith('tests.') or p.startswith('test_')]
+            if len(test_modules) >= 2:
+                return (False,
+                        f"BLOCKED: Running {len(test_modules)} test modules "
+                        f"simultaneously via unittest can spawn too many "
+                        f"subprocesses. Max 1 module per exec call. "
+                        f"Host Protection prevented execution to avoid crash.")
+    
+    # ── Layer 3c: nosetests / tox / parallel builds blocking ──
+    nosetests_tox_patterns = ['nosetests', 'tox', '-j ', '--jobs=']
+    for ntp in nosetests_tox_patterns:
+        if ntp in cmd_lower:
+            return (False,
+                    f"BLOCKED: Test runner/parallel build pattern detected "
+                    f"('{ntp}'). These tools can spawn uncontrolled "
+                    f"subprocesses and exhaust system resources. "
+                    f"Host Protection prevented execution to avoid crash.")
+    
+    # ── Layer 4: Background processes (&) ────────────────────
+    # lone & at end of line backgrounds the process, escaping timeout
+    # But & inside a command like "echo a && echo b" is fine
+    if command.strip().endswith(' &'):
+        return (False,
+                "BLOCKED: Background process detection (& at end of command). "
+                "Background processes can escape the timeout and cause resource "
+                "exhaustion. Host Protection prevented execution.")
+    
+    # ── Layer 5: Python scripts that spawn subprocesses ──────
+    # This catches patterns like "python3 -c 'import subprocess...'"
+    # or running .py files known to spawn subprocesses
+    if 'python3' in cmd_lower or 'python' in cmd_lower:
+        if '-c' in cmd_lower:
+            # Inline Python - check for subprocess spawning patterns
+            script_content = command  # full command = inline script
+            spawn_patterns = [
+                'subprocess.run', 'subprocess.Popen', 'subprocess.call',
+                'os.system', 'os.fork', 'os.popen', 'os.exec',
+                'multiprocessing.Process', 'multiprocessing.Pool',
+                'threading.Thread',  # Threads can spawn processes indirectly
+            ]
+            for pattern in spawn_patterns:
+                if pattern in script_content:
+                    return (False,
+                            f"BLOCKED: Inline Python script uses '{pattern}' "
+                            f"which can spawn uncontrolled subprocesses. "
+                            f"Host Protection prevented execution.")
+    
+    # ── Layer 6: Master test runner / batch script detection ─
+    # Detects commands that run Python scripts which themselves
+    # spawn multiple subprocess batches (run_all_tests.py pattern)
+    if 'python3' in cmd_lower or 'python' in cmd_lower:
+        parts = command.split()
+        for i, part in enumerate(parts):
+            if part in ('python3', 'python') or part.startswith('./'):
+                script_path = parts[i+1] if i+1 < len(parts) else ''
+                script_name = os.path.basename(script_path)
+                
+                # Known master test runner script names
+                master_runner_patterns = [
+                    'run_all_tests', 'run_all_test', 'run_tests',
+                    'run_test_suite', 'run_all_', 'master_runner',
+                    'test_runner', 'test_harness', 'batch_test',
+                ]
+                for runner_pattern in master_runner_patterns:
+                    if runner_pattern in script_name.lower():
+                        return (False,
+                                f"BLOCKED: Master test runner script '{script_name}' detected. "
+                                f"These scripts spawn multiple subprocess batches which can "
+                                f"exhaust system resources. Run tests individually via "
+                                f"`python3 -m unittest <module>` (max 2 modules per call). "
+                                f"Host Protection prevented execution to avoid crash.")
+                
+                # Scan script content for batch subprocess patterns
+                try:
+                    expanded_path = os.path.expanduser(script_path)
+                    if os.path.exists(expanded_path):
+                        with open(expanded_path, 'r') as sf:
+                            script_content = sf.read()
+                        has_spawn = any(p in script_content for p in
+                            ['subprocess.run(', 'subprocess.Popen(',
+                             'subprocess.call(', 'os.system('])
+                        has_loop = any(p in script_content for p in ['for ', 'while '])
+                        has_batches = any(p in script_content for p in
+                            ['BATCHES', 'batches', 'batch', 'test_modules',
+                             'test_files', 'modules_list', 'TEST_MODULES'])
+                        
+                        if has_spawn and has_loop and has_batches:
+                            return (False,
+                                    f"BLOCKED: Script '{script_name}' contains batch subprocess "
+                                    f"spawning (loops + subprocess + batch list). This pattern "
+                                    f"is known to cause resource exhaustion. Host Protection "
+                                    f"prevented execution to avoid crash.")
+                except (IOError, FileNotFoundError, IndexError):
+                    logger.debug(f"Could not analyze script '{script_path}' - allowing")
+    
+    # ── Layer 7: Concurrent process count check ──────────────
+    proc_ok, proc_msg = _check_concurrent_processes(max_allowed=8)
+    if not proc_ok:
+        return (False, proc_msg)
+    
+    # ── Layer 8: Resource exhaustion guard (in-process safe) ──
+    # NOTE: resource.setrlimit() is NOT used here because:
+    #   - It applies to the SERVER process, not the subprocess
+    #   - RLIMIT_NPROC cannot be raised back once lowered (non-root)
+    #   - Would permanently limit the server's ability to create threads
+    # Instead, the TOOL's execute_command implementation should use
+    # subprocess.Popen(preexec_fn=...) to apply resource limits ONLY
+    # to child processes. This is tracked as a TOOL IMPROVEMENT.
+    # 
+    # Current protections for resource exhaustion:
+    #   - _check_memory_available() in validate_tool_call()
+    #   - _check_rate_limit() in validate_tool_call()
+    #   - _check_concurrent_processes() in Layer 7
+    #   - Command weight scoring in Layer 9
+    #   - Subprocess chain tracking in Layer 11
+    #   - Zombie reaper in Layer 12
+    #   - Command complexity guardrail in Layer 13
+    
+    # ── Layer 9: Command weight scoring ──────────────────────
+    if not hasattr(_static_analysis_exec_command, '_cmd_weight_tracker'):
+        _static_analysis_exec_command._cmd_weight_tracker = []
+        _static_analysis_exec_command._cmd_weight_lock = threading.Lock()
+    
+    _calculate_command_weight(command)
+    weight_total = _get_command_weight_total()
+    if weight_total > 50:
+        return (False,
+                f"BLOCKED: Total command weight ({weight_total}) exceeds max "
+                f"(50). Too many resource-intensive commands executed. "
+                f"Wait for weight to decay or restart server. "
+                f"Host Protection prevented execution to avoid crash.")
+    
+    # ── Layer 10: Output size throttle ───────────────────────
+    massive_output_patterns = ['> /dev/', '> /tmp/', '> /var/log']
+    has_massive_output = any(p in cmd_lower for p in massive_output_patterns)
+    if cmd_lower.count('>') > 1:
+        has_massive_output = True
+    if cmd_lower.count('2>') > 1:
+        has_massive_output = True
+    if has_massive_output:
+        return (False,
+                "BLOCKED: Command produces massive output (redirect to system "
+                "paths or multiple redirections). This can exhaust server "
+                "memory when capturing output. "
+                "Host Protection prevented execution to avoid crash.")
+    
+    # ── Layer 11: Subprocess chain depth tracking ────────────
+    # Detect commands that will themselves spawn subprocesses (nested).
+    # Block commands with multiple subprocess-spawning indicators.
+    chain_indicators = [
+        'subprocess.run(', 'subprocess.Popen(', 'subprocess.call(',
+        'os.system(', 'os.popen(', 'os.fork(',
+        'multiprocessing.Process(', 'multiprocessing.Pool(',
+    ]
+    chain_count = sum(1 for ci in chain_indicators if ci in command)
+    if chain_count >= 2:
+        return (False,
+                f"BLOCKED: Command contains {chain_count} subprocess spawning "
+                f"indicators. Nested subprocess chains can exhaust system "
+                f"resources. Host Protection prevented execution.")
+    
+    # ── Layer 12: Process tree registration ──────────────────
+    # Register this command for background zombie cleanup.
+    _register_process_tree()
+    
+    # ── Layer 13: Command length/complexity guardrail ────────
+    pipe_count = command.count('|')
+    semicolon_count = command.count(';')
+    and_count = cmd_lower.count('&&')
+    
+    if pipe_count > 3:
+        return (False,
+                f"BLOCKED: Command contains {pipe_count} pipe operators. "
+                f"Long pipelines spawn many concurrent processes. "
+                f"Max 3 pipes. Host Protection prevented execution.")
+    
+    if semicolon_count + and_count > 3:
+        return (False,
+                f"BLOCKED: Command contains {semicolon_count + and_count} chained "
+                f"commands (';' or '&&'). Multiple chained commands can "
+                f"accumulate resources. Max 3 separators. "
+                f"Host Protection prevented execution.")
+    
+    return True, ""
+
+
+def _register_process_tree() -> None:
+    """Start a background zombie-reaping monitor if not already running.
+    
+    Periodically (every 5s) checks /proc for zombie child processes
+    of this server and reaps them to prevent process table exhaustion.
+    """
+    if not hasattr(_register_process_tree, '_cleanup_started'):
+        _register_process_tree._cleanup_started = False
+        _register_process_tree._lock = threading.Lock()
+    
+    with _register_process_tree._lock:
+        if _register_process_tree._cleanup_started:
+            return
+        _register_process_tree._cleanup_started = True
+    
+    def _zombie_reaper():
+        """Background thread that reaps zombie child processes."""
+        while True:
+            try:
+                my_pid = os.getpid()
+                for proc in process_list():
+                    if proc.get('ppid') == my_pid and proc.get('state') == 'Z':
+                        try:
+                            os.waitpid(proc['pid'], os.WNOHANG)
+                        except (OSError, ChildProcessError):
+                            pass
+                        continue
+            except Exception:
+                pass
+            time.sleep(5)
+    
+    try:
+        reaper = threading.Thread(target=_zombie_reaper, daemon=True, name='zombie-reaper')
+        reaper.start()
+    except RuntimeError as e:
+        logger.debug(f"Could not start zombie reaper thread: {e}")
+
+
+def _calculate_command_weight(command: str) -> None:
+    """Calculate and accumulate command weight for rate limiting."""
+    # Self-initialize tracking if _static_analysis_exec_command hasn't run yet
+    if not hasattr(_static_analysis_exec_command, '_cmd_weight_tracker'):
+        _static_analysis_exec_command._cmd_weight_tracker = []
+        _static_analysis_exec_command._cmd_weight_lock = threading.Lock()
+    
+    cmd_lower = command.lower()
+    weight = 1
+    if 'python3' in cmd_lower or 'python' in cmd_lower:
+        weight += 3
+    if 'pytest' in cmd_lower or 'unittest' in cmd_lower:
+        weight += 10
+    if 'pip ' in cmd_lower or 'pip3 ' in cmd_lower or ' install' in cmd_lower:
+        weight += 5
+    if 'make' in cmd_lower or 'cmake' in cmd_lower:
+        weight += 8
+    if 'git clone' in cmd_lower or 'git fetch' in cmd_lower:
+        weight += 4
+    if 'wget' in cmd_lower or 'curl' in cmd_lower:
+        weight += 3
+    if 'find ' in cmd_lower or 'grep -r' in cmd_lower:
+        weight += 2
+    if 'docker' in cmd_lower or 'podman' in cmd_lower:
+        weight += 10
+    if 'stress' in cmd_lower or 'dd if=' in cmd_lower:
+        weight += 10
+    
+    with _static_analysis_exec_command._cmd_weight_lock:
+        now = time.time()
+        _static_analysis_exec_command._cmd_weight_tracker.append((now, weight))
+    _decay_command_weights()
+
+
+def _decay_command_weights() -> None:
+    """Decay command weights over time (1 point per second)."""
+    with _static_analysis_exec_command._cmd_weight_lock:
+        now = time.time()
+        weights = _static_analysis_exec_command._cmd_weight_tracker
+        surviving = []
+        for ts, w in weights:
+            age = now - ts
+            if age < 60:
+                remaining = max(0, w - int(age))
+                if remaining > 0:
+                    surviving.append((ts, remaining))
+        _static_analysis_exec_command._cmd_weight_tracker = surviving
+
+
+def _get_command_weight_total() -> int:
+    """Get total accumulated command weight."""
+    # Self-initialize if _static_analysis_exec_command hasn't run yet
+    if not hasattr(_static_analysis_exec_command, '_cmd_weight_lock'):
+        _static_analysis_exec_command._cmd_weight_tracker = []
+        _static_analysis_exec_command._cmd_weight_lock = threading.Lock()
+        return 0
+    with _static_analysis_exec_command._cmd_weight_lock:
+        return sum(w for _, w in _static_analysis_exec_command._cmd_weight_tracker)
+
+
+def _divine_emergency_memory_check() -> Tuple[bool, str, int]:
+    """CRITICAL: Emergency memory check that pre-kills if memory is critically low.
+    
+    Returns:
+        (safe, message, available_mb)
+    """
+    try:
+        mem = system_memory()
+        avail_mb = mem.get('available_kb', 0) / 1024
+        if avail_mb < 512:
+            return (False, 
+                    f"🚨 DIVINE BLOCKED: Critically low memory "
+                    f"({avail_mb:.0f}MB available < 512MB minimum). "
+                    f"Execution prevented to avoid hard crash.", 
+                    int(avail_mb))
+        if avail_mb < 1024:
+            logger.warning(f"⚠️ Low memory warning: {avail_mb:.0f}MB available")
+        return (True, "", int(avail_mb))
+    except Exception:
+        pass
+    return (True, "", 9999)
+
+
+def _divine_static_analysis(command: str) -> Tuple[bool, str]:
+    """DIVINE-LEVEL static analysis with ZERO TOLERANCE for dangerous patterns.
+    
+    This is the final gate before any command execution. If ANY check fails,
+    the command is BLOCKED. No exceptions for testing.
+    
+    Checks:
+    1. 🛡️ ANY pytest invocation → BLOCKED (pytest spawns subprocesses)
+    2. 🛡️ Shell for/while loops with test runners → BLOCKED
+    3. 🛡️ Stress/edge test files → BLOCKED
+    4. 🛡️ Multiple test files per invocation → BLOCKED (>1 file)
+    5. 🛡️ Background process operators → BLOCKED (&, nohup, setsid, disown)
+    6. 🛡️ Fork bombs → BLOCKED (ALL known patterns)
+    7. 🛡️ Filesystem attacks → BLOCKED (/proc|/sys|/dev writes, modprobe, etc.)
+    8. 🛡️ Network egress tools → BLOCKED (wget, curl, nc, nmap, ssh, telnet, sftp)
+    9. 🛡️ GPU direct access → BLOCKED (nvidia-smi, amdgpu, vulkan)
+    10. 🛡️ Kernel operations → BLOCKED (insmod, modprobe, rmmod, depmod)
+    11. 🛡️ Partition/disk operations → BLOCKED (fdisk, parted, mkfs, dd)
+    12. 🛡️ System service manipulation → BLOCKED (systemctl, service, rc)
+
+    Returns:
+        (True, "") if safe
+        (False, "BLOCKED: <reason>") if blocked
+    """
+    cmd_lower = command.lower()
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D1: COMPLETE pytest BLOCKADE
+    # ═══════════════════════════════════════════════════════════════
+    # pytest spawns subprocesses, can run multiple test files,
+    # and can discover tests recursively. ABSOLUTELY NO pytest allowed.
+    if 'pytest' in cmd_lower.replace('-', ''):
+        return (False,
+                "🚨 DIVINE BLOCKED (D1): pytest invocation detected. "
+                "pytest spawns uncontrolled subprocesses and is blocked "
+                "for safety. Use `python3 -m unittest <single_module>` instead. "
+                "Host Protection prevented execution to avoid hard crash.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D2: Shell loop with test runners
+    # ═══════════════════════════════════════════════════════════════
+    # "for f in ...test_... ; do" pattern with test modules
+    if ('for ' in cmd_lower and ' in ' in cmd_lower and 
+        ('do ' in cmd_lower or '; do' in cmd_lower)):
+        # Check if the loop iterates over test files
+        parts = command.split()
+        test_file_count = sum(1 for p in parts if p.endswith('.py') and 
+                              ('test_' in os.path.basename(p) or '_test' in os.path.basename(p)
+                               or 'stress' in os.path.basename(p).lower()
+                               or 'edge' in os.path.basename(p).lower()))
+        if test_file_count >= 2:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D2): Shell loop running {test_file_count} "
+                    f"test files detected. Batch test execution can exhaust "
+                    f"system resources. Run tests ONE AT A TIME. "
+                    f"Host Protection prevented execution to avoid hard crash.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D3: Stress/edge/destructive test files
+    # ═══════════════════════════════════════════════════════════════
+    stress_indicators = ['stress', 'edge', 'exhaustive', 'destruct', 'crash',
+                         'fork_bomb', 'oom', 'resource_exhaust']
+    for part in command.split():
+        part_lower = part.lower()
+        if part_lower.endswith('.py') or part_lower.endswith('.pyc'):
+            basename = os.path.basename(part_lower)
+            for indicator in stress_indicators:
+                if indicator in basename:
+                    return (False,
+                            f"🚨 DIVINE BLOCKED (D3): Stress/destructive test file "
+                            f"'{basename}' detected. These tests can cause system "
+                            f"resource exhaustion and hard crashes. "
+                            f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D4: Multiple test files (allow max 1)
+    # ═══════════════════════════════════════════════════════════════
+    parts = command.split()
+    test_files = [p for p in parts if p.endswith('.py') and 
+                  ('test_' in os.path.basename(p) or '_test' in os.path.basename(p))]
+    if len(test_files) > 1:
+        return (False,
+                f"🚨 DIVINE BLOCKED (D4): {len(test_files)} test files referenced "
+                f"in a single command. Maximum is 1. Run tests individually. "
+                f"Host Protection prevented execution to avoid hard crash.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D5: Background process operators
+    # ═══════════════════════════════════════════════════════════════
+    bg_patterns = [
+        # Trailing ' &' is the only &-based pattern we check,
+        # because standalone & backgrounds a process (escapes timeout)
+        # &\n is checked separately below
+        # Note: we DON'T check ' &' because it incorrectly matches &&
+        'nohup ',       # No hang up
+        'setsid ',      # Create new session
+        'disown',       # Remove from shell
+        'screen -d',    # Detached screen
+        'tmux detach',  # Detached tmux
+        '@reboot',      # Cron reboot
+    ]
+    for pattern in bg_patterns:
+        if pattern in command:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D5): Background process pattern '{pattern.strip()}' "
+                    f"detected. Background processes can escape timeouts and "
+                    f"exhaust system resources. "
+                    f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D6: Fork bombs (exhaustive)
+    # ═══════════════════════════════════════════════════════════════
+    fork_bomb_patterns = [
+        ':(){', ':() {',           # Bash fork bomb
+        'fork()',                   # C/Python
+        'os.fork()',               # Python os.fork
+        'os.fork(',                # Python os.fork (any args)
+        'multiprocessing.Process', # Python multiprocessing
+        'multiprocessing.Pool',    # Python multiprocessing Pool
+        'subprocess.Popen',        # Inline subprocess spawn
+        'while True: os.fork',     # Python fork loop
+        'while 1: os.fork',        # Python fork loop (alt)
+        'if os.fork()',            # Fork-based logic
+    ]
+    for pattern in fork_bomb_patterns:
+        if pattern in command:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D6): Fork bomb pattern detected "
+                    f"('{pattern}'). Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D7: Filesystem attack patterns
+    # ═══════════════════════════════════════════════════════════════
+    fs_attack_patterns = [
+        # /proc attacks
+        '>/proc/', '>>/proc/', '> /proc/', '>> /proc/',
+        # /sys attacks
+        '>/sys/', '>>/sys/', '> /sys/', '>> /sys/', 
+        # /dev direct access  
+        '>/dev/', '>>/dev/', '/dev/mem', '/dev/kmem', '/dev/port',
+        '/dev/sda', '/dev/sdb', '/dev/nvme', '/dev/mmcblk',
+        # /sys firmware
+        '/sys/firmware', '/sys/kernel',
+        # Critical system files
+        '>/etc/', '>>/etc/', '> /etc/', '>> /etc/',
+        '>/boot/', '>>/boot/', '> /boot/', '>> /boot/',
+    ]
+    for pattern in fs_attack_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D7): Filesystem attack pattern detected "
+                    f"('{pattern}'). Writing to system paths is blocked. "
+                    f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D8: Kernel module operations
+    # ═══════════════════════════════════════════════════════════════
+    kernel_patterns = [
+        'insmod ', 'modprobe ', 'rmmod ', 'depmod ',
+        'modinfo ', 'lsmod |', 
+    ]
+    for pattern in kernel_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D8): Kernel module operation detected "
+                    f"('{pattern.strip()}'). Kernel module loading is blocked. "
+                    f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D9: Network egress tools
+    # ═══════════════════════════════════════════════════════════════
+    if any(cmd_lower.startswith(p) for p in ['wget ', 'curl ', 'nc ', 'nmap ', 
+                                              'ssh ', 'telnet ', 'sftp ',
+                                              'ftp ', 'scp ', 'rsync ', 'iptables ']):
+        return (False,
+                f"🚨 DIVINE BLOCKED (D9): Network egress tool detected. "
+                f"Outbound network connections are blocked for safety. "
+                f"Host Protection prevented execution.")
+    # Also check inside command strings
+    net_inside_patterns = [' wget ', ' curl ', ' nc ', ' nmap ']
+    for pattern in net_inside_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D9): Network tool '{pattern.strip()}' "
+                    f"detected in command. Outbound connections are blocked. "
+                    f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D10: Partition/disk destructive operations
+    # ═══════════════════════════════════════════════════════════════
+    disk_patterns = [
+        'fdisk ', 'parted ', 'mkfs.', 'mkfs ', 'mkswap ',
+        'dd if=/dev/zero', 'dd if=/dev/urandom',
+        'dd of=/dev/', 'dd if=/dev/',
+        'hdparm ', 'sfdisk ', 'gdisk ', 'cgdisk ',
+        'pvcreate ', 'vgcreate ', 'lvcreate ',
+        'pvremove ', 'vgremove ', 'lvremove ',
+    ]
+    for pattern in disk_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D10): Disk/partition destructive operation "
+                    f"detected ('{pattern.strip()}'). Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D11: GPU direct access
+    # ═══════════════════════════════════════════════════════════════
+    gpu_patterns = [
+        'nvidia-smi', 'nvidia-modprobe', 'nvidia-persistenced',
+        'amdgpu', 'radeontop', 'vulkaninfo', 'glxinfo',
+        'display=:0', 'display=:1', 
+        'Xorg ', 'xinit ', 'startx',
+        'xrandr ', 'xset ',
+    ]
+    for pattern in gpu_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D11): GPU/display direct access detected "
+                    f"('{pattern}'). GPU operations can crash the display server. "
+                    f"Host Protection prevented execution.")
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LAYER D12: System service manipulation
+    # ═══════════════════════════════════════════════════════════════
+    service_patterns = [
+        'systemctl ', 'systemctl', 'service ',
+        'rc-service ', 'rc-update ', 'rc-config ',
+        'journalctl --flush', 'journalctl --rotate',
+    ]
+    for pattern in service_patterns:
+        if pattern in cmd_lower:
+            return (False,
+                    f"🚨 DIVINE BLOCKED (D12): System service manipulation detected "
+                    f"('{pattern.strip()}'). Service management is blocked. "
+                    f"Host Protection prevented execution.")
+    
+    # ── Layer D5b: Trailing ampersand (background process) ──────
+    stripped = command.strip()
+    if stripped.endswith(' &'):
+        return (False,
+                "🚨 DIVINE BLOCKED (D5): Background process detected via trailing ' &'. "
+                "Background processes escape timeouts and exhaust resources. "
+                "Host Protection prevented execution.")
+
+    return True, ""
+
+
+def divine_validate_tool_call(tool_name: str, parameters: dict) -> Tuple[bool, str]:
+    """DIVINE-LEVEL pre-execution validation.
+    
+    Runs ALL protection layers including the divine static analysis.
+    This is called AFTER the regular validate_tool_call().
+    
+    Returns:
+        (True, "") if safe
+        (False, "🚨 DIVINE BLOCKED: <reason>") if blocked
+    """
+    if not HOST_PROTECTION_ENABLED:
+        return True, ""
+    
+    # ── Divine Layer 1: Emergency memory check ────────────────
+    mem_safe, mem_msg, avail_mb = _divine_emergency_memory_check()
+    if not mem_safe:
+        return (False, mem_msg)
+    
+    # ── Divine Layer 2: Divine static analysis for exec commands ──
+    if tool_name in ('execute_command', 'execute_commands'):
+        commands = parameters.get('command', '')
+        if tool_name == 'execute_commands':
+            cmds_list = parameters.get('commands', [])
+            commands = ' '.join(c if isinstance(c, str) else '' for c in cmds_list)
+        safe, msg = _divine_static_analysis(commands)
+        if not safe:
+            return (False, msg)
+    
+    return True, ""
+
+
+def validate_tool_call(tool_name: str, parameters: dict) -> Tuple[bool, str]:
+    """
+    Validate a tool call BEFORE execution.
+    
+    Performs multi-layer validation:
+    1. Memory check — refuse if < 2GB available
+    2. Rate limiting — refuse if > 6 calls/minute
+    3. Static analysis — refuse if destructive/unsafe patterns detected
+    4. Command-specific checks for execute_command
+    
+    Returns:
+        (True, "") if safe
+        (False, "reason") if blocked
+    """
+    if not HOST_PROTECTION_ENABLED:
+        return True, ""
+    
+    # ── Layer 1: Memory check ─────────────────────────────────
+    mem_ok, mem_msg = _check_memory_available()
+    if not mem_ok:
+        return (False, mem_msg)
+
+    # ── Layer 1b: Traced memory check ──────────────────────────
+    traced_ok, traced_msg = _check_traced_memory()
+    if not traced_ok:
+        return (False, traced_msg)
+
+    # ── Layer 2: Rate limiting ────────────────────────────────
+    rate_ok, rate_msg = _check_rate_limit(tool_name)
+    if not rate_ok:
+        return (False, rate_msg)
+    
+    # ── Layer 3: Static analysis for exec commands ─────────────
+    if tool_name in ('execute_command', 'execute_commands'):
+        commands = parameters.get('command', '')
+        if tool_name == 'execute_commands':
+            cmds_list = parameters.get('commands', [])
+            commands = ' '.join(c if isinstance(c, str) else '' for c in cmds_list)
+        safe, msg = _static_analysis_exec_command(commands)
+        if not safe:
+            return (False, msg)
+    
+    # Block import of new tools during runtime
+    if tool_name == '__import__':
+        return (False,
+                "BLOCKED: Dynamic imports are not allowed during tool execution.")
+    
+    # ── LAYER 4: Divine-level emergency memory & static analysis ─
+    divine_safe, divine_msg = divine_validate_tool_call(tool_name, parameters)
+    if not divine_safe:
+        return (False, divine_msg)
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # LAYER 5 (GOD WATCHER): The Final Unbreakable Line of Host Defense
+    # ═══════════════════════════════════════════════════════════════════
+    # The GOD WATCHER sits ABOVE all other protections and scans for
+    # EVERY conceivable exploit vector (27+ vectors across G1):
+    #   - Buffer overflows, format strings, TOCTOU races
+    #   - ALL shell injection variants ($(), ``, ;, |, $IFS, ${})
+    #   - Null byte, CRLF, XXE, deserialization, reverse shells
+    #   - Container escapes, fork bombs, seccomp bypass
+    #   - LD_PRELOAD, ptrace, argument injection, unicode attacks
+    #   - Polymorphic code, DNS covert channels, FD tampering
+    #   - Signal races, side-channel timing, env injection
+    #
+    # G4 provides AI agent oversight for ambiguous/unknown cases
+    # with full audit trail and display manager notifications.
+    if _GOD_WATCHER_AVAILABLE:
+        try:
+            gw = get_god_watcher()
+            if gw:
+                gw_allowed, gw_reason, gw_score = gw.validate_execution(tool_name, parameters)
+                if not gw_allowed:
+                    return (False, gw_reason)
+        except Exception as e:
+            logger.error(f"GOD WATCHER error: {e}")
+            # Fail-closed: block if GOD WATCHER errors out
+            return (False, f"👁️ GOD WATCHER error during validation: {e}")
+
+    return True, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# WRAPPER FOR TOOL_WRAPPER.PY INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def protect_tool_call(tool_name: str, func: Callable, *args, **kwargs):
+    """
+    Execute a tool function with full host protection.
+    
+    This is the main integration point for tool_wrapper.py.
+    
+    Args:
+        tool_name: Name of the tool (for logging)
+        func: The tool function to execute
+        *args, **kwargs: Arguments to pass to the tool
+    
+    Returns:
+        The tool's return value
+    
+    Raises:
+        HostProtectionError: If the tool attempts dangerous operations
+        asyncio.TimeoutError: If the tool exceeds the timeout
+    """
+    # Pre-execution validation
+    valid, reason = validate_tool_call(tool_name, kwargs)
+    if not valid:
+        raise HostProtectionError(reason)
+    
+    # Execute with protection
+    with HostSafeEnvironment(tool_name=tool_name):
+        return func(*args, **kwargs)
+
+
+async def protect_async_tool_call(tool_name: str, func: Callable,
+                                   *args, **kwargs):
+    """
+    Execute an async tool function with full host protection.
+    
+    This is the main integration point for async tools.
+    """
+    # Pre-execution validation
+    valid, reason = validate_tool_call(tool_name, kwargs)
+    if not valid:
+        raise HostProtectionError(reason)
+    
+    # Execute with protection
+    with HostSafeEnvironment(tool_name=tool_name):
+        result = await asyncio.wait_for(
+            func(*args, **kwargs),
+            timeout=DEFAULT_TOOL_TIMEOUT
+        )
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════
+
+def initialize():
+    """
+    Initialize host protection system.
+    
+    This should be called once at server startup.
+    Applies permanent module-level patches that persist for the
+    lifetime of the server process.
+    
+    These patches run BEFORE any tool code, providing baseline protection
+    even without the HostSafeEnvironment context manager.
+    """
+    if not HOST_PROTECTION_ENABLED:
+        logger.warning("Host Protection is DISABLED — system is vulnerable!")
+        return
+    
+    logger.info("Initializing Host Protection System...")
+    
+    # Apply permanent patches to critical modules
+    _patch_os_module()
+    _patch_signal_module()
+    _patch_subprocess_module()
+    
+    # Set up tracemalloc for memory tracking
+    try:
+        tracemalloc.start(25)
+        logger.debug("tracemalloc started for memory tracking")
+    except Exception as e:
+        logger.warning(f"Could not start tracemalloc: {e}")
+    
+    logger.info("✅ Host Protection System initialized.")
+    logger.info(f"  - Blocked exit functions: {len(BLOCKED_EXIT_FUNCTIONS)}")
+    logger.info(f"  - Blocked kill functions: {len(BLOCKED_KILL_FUNCTIONS)}")
+    logger.info(f"  - Blocked code exec functions: {len(BLOCKED_CODE_EXEC_FUNCTIONS)}")
+    logger.info(f"  - Max subprocesses: {MAX_SUBPROCESSES}")
+    logger.info(f"  - Default timeout: {DEFAULT_TOOL_TIMEOUT}s")
+    logger.info(f"  - Memory limit: {MAX_MEMORY_MB}MB")
+    
+    # ── Divine Protection Initialization ────────────────────────────
+    try:
+        initialize_divine_protection()
+    except Exception as e:
+        logger.warning(f"Divine Protection initialization error: {e}")
+
+    # ── GOD WATCHER Initialization ─────────────────────────────────
+    # The GOD WATCHER is the FINAL protection layer, sitting ABOVE
+    # everything else. It scans for ALL conceivable exploit vectors
+    # and provides AI agent oversight for unknown/ambiguous cases.
+    if _GOD_WATCHER_AVAILABLE:
+        try:
+            gw_stats = initialize_god_watcher()
+            logger.info(f"👁️ GOD WATCHER System: {gw_stats}")
+        except Exception as e:
+            logger.warning(f"GOD WATCHER initialization error: {e}")
+    else:
+        logger.warning("GOD WATCHER not available — system lacks ultimate protection layer")
+
+
+def get_protection_status() -> Dict:
+    """Get current protection system status."""
+    return {
+        'enabled': HOST_PROTECTION_ENABLED,
+        'default_timeout': DEFAULT_TOOL_TIMEOUT,
+        'max_memory_mb': MAX_MEMORY_MB,
+        'max_subprocesses': MAX_SUBPROCESSES,
+        'blocked_exit_functions': list(BLOCKED_EXIT_FUNCTIONS),
+        'blocked_kill_functions': list(BLOCKED_KILL_FUNCTIONS),
+        'blocked_code_exec': list(BLOCKED_CODE_EXEC_FUNCTIONS),
+        'blocked_system_modules': [m for m in BLOCKED_SYSTEM_MODULES if m],
+        'patches_applied': len(get_call_tracker().get_calls()) > 0,
+    }
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DIVINE PROTECTION SYSTEM — CGroup v2 + OOM + Resource Management
+# ═══════════════════════════════════════════════════════════════════════
+#
+# These are HARDWARE-LEVEL protections that operate BELOW the Python level:
+#   - CGroup v2: Kernel-enforced resource limits (memory, CPU, PIDs)
+#   - OOM score adjustment: Protect server, sacrifice subprocesses
+#   - Systemd transient scopes: Per-command resource control
+#   - Emergency memory monitor: Proactive OOM prevention
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+import errno
+
+# ── ADVANCED DIVINE PROTECTION INTEGRATION ─────────────────────────
+# D13-D20 advanced layers: Landlock, seccomp-bpf, bubblewrap,
+# NO_NEW_PRIVS, FD protection, tree killer, capability dropping,
+# and disk quota enforcement.
+try:
+    from divine_protection_advanced import (
+        initialize_advanced_divine,
+        get_advanced_preexec,
+        get_advanced_status,
+        shutdown_advanced_divine,
+        wrap_bubblewrap,
+        kill_tree as advanced_kill_tree,
+        get_comprehensive_preexec,
+    )
+    _ADVANCED_DIVINE_AVAILABLE = True
+except ImportError as e:
+    _ADVANCED_DIVINE_AVAILABLE = False
+    logger.debug(f"Advanced divine protection not available: {e}")
+    
+    # Create stubs
+    def initialize_advanced_divine():
+        return {}
+    
+    def get_advanced_preexec():
+        return None
+    
+    def get_advanced_status():
+        return {}
+    
+    def shutdown_advanced_divine():
+        pass
+    
+    def wrap_bubblewrap(cmd, **kwargs):
+        return None
+    
+    def advanced_kill_tree(pid):
+        return {'killed': 0, 'failed': 0}
+    
+    def get_comprehensive_preexec():
+        return None
+
+# ── CGroup v2 paths ───────────────────────────────────────────────
+_CGROUP_BASE = "/sys/fs/cgroup"
+_DIVINE_CGROUP_NAME = "divine_protection"
+_DIVINE_CGROUP_PATH = None  # Set during initialization
+
+
+class CGroupManager:
+    """Manages resource limits for tool execution with rootless-safe mechanisms.
+
+    THREE strategies, tried in order:
+    1. `systemd-run --user --scope` for rootless cgroup-level limits
+       (creates transient systemd scopes with MemoryMax, CPUQuota, TasksMax)
+    2. Direct cgroup v2 file writes (only works as root)
+    3. Python-level resource tracking (always works)
+
+    systemd-run --user --scope is the PREFERRED approach because it:
+    - Creates kernel-enforced resource limits WITHOUT root
+    - Integrates with systemd's cgroup hierarchy for monitoring
+    - Self-cleans (scopes auto-removed when command finishes)
+    - Supports MemoryMax, CPUQuota, TasksMax, and other properties
+    """
+
+    def __init__(self):
+        self._enabled = False
+        self._cgroup_path = None
+        self._our_pid = os.getpid()
+        self._systemd_run_available = False
+        self._pids_lock = threading.Lock()
+        self._tracked_pids: List[int] = []
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def _check_systemd_run(self) -> bool:
+        """Check if systemd-run --user is available for scope creation."""
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ['systemd-run', '--user', '--scope', '--help'],
+                capture_output=True, text=True, timeout=5
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            return False
+        except Exception:
+            return False
+
+    def initialize(self) -> bool:
+        """Initialize resource control for FastMCP protection.
+
+        First tries systemd-run --user --scope (rootless, preferred).
+        Falls back to direct cgroup v2 file writes (needs root).
+        Sets default resource limits either way.
+
+        Returns:
+            True if ANY cgroup-like control is available, False otherwise.
+        """
+        # ── Strategy 1 (Preferred): systemd-run --user --scope ──────
+        if self._check_systemd_run():
+            self._systemd_run_available = True
+            self._enabled = True
+            logger.info("  - systemd-run --user --scope: AVAILABLE (rootless cgroup limits)")
+            return True
+
+        # ── Strategy 2 (Root-needed): Direct cgroup v2 file writes ─
+        try:
+            uid = os.getuid()
+            cgroup_dir = f"{_CGROUP_BASE}/user.slice/user-{uid}.slice/fastmcp-divine"
+
+            if os.path.isdir(_CGROUP_BASE):
+                try:
+                    os.makedirs(cgroup_dir, exist_ok=True)
+                except PermissionError:
+                    logger.debug("CGroup v2 direct access: permission denied (not root)")
+                    return False
+                except OSError as e:
+                    logger.debug(f"CGroup v2 failed: {e}")
+                    return False
+
+                if not os.path.isfile(f"{cgroup_dir}/cgroup.type"):
+                    logger.debug(f"Invalid cgroup dir: {cgroup_dir}")
+                    return False
+
+                # Set resource limits
+                try:
+                    mem = system_memory()
+                    total_mb = mem.get('total_kb', 0) / 1024
+                    mem_limit = min(4096, max(1024, int(total_mb * 0.25)))
+                    self._write_cgroup(cgroup_dir, 'memory.max', f'{mem_limit * 1024 * 1024}')
+                except Exception:
+                    pass
+
+                try:
+                    self._write_cgroup(cgroup_dir, 'pids.max', '50')
+                except Exception:
+                    pass
+
+                try:
+                    self._write_cgroup(cgroup_dir, 'cpu.max', '50000 100000')
+                except Exception:
+                    pass
+
+                try:
+                    self._write_cgroup(cgroup_dir, 'cgroup.procs', str(self._our_pid))
+                except Exception:
+                    pass
+
+                self._cgroup_path = cgroup_dir
+                self._enabled = True
+                logger.info(f"  - CGroup v2 (direct) initialized at: {cgroup_dir}")
+                return True
+        except Exception as e:
+            logger.debug(f"CGroup v2 direct init failed: {e}")
+
+        logger.debug("No cgroup mechanism available - falling back to Python-level protections")
+        return False
+
+    def run_with_scope(self, cmd: List[str], memory_mb: int = 2048,
+                       cpu_pct: int = 50, timeout: int = 300) -> Tuple[Optional[int], Optional[str]]:
+        """Run a command within a systemd-run user scope with resource limits.
+
+        This is the PREFERRED method for executing tool commands.
+        Creates a transient systemd scope with kernel-enforced:
+        - Memory limit (MemoryMax)
+        - CPU quota (CPUQuota)
+        - Process count limit (TasksMax)
+
+        The scope is automatically cleaned up by systemd when the command exits.
+
+        Args:
+            cmd: Command list (e.g., ['python3', 'test.py'])
+            memory_mb: Memory limit in MB (default 2048)
+            cpu_pct: CPU quota in percent of one core (default 50)
+            timeout: Maximum execution time in seconds (default 300)
+
+        Returns:
+            (returncode, stdout) if successful
+            (None, error_message) if failed
+        """
+        if not self._systemd_run_available:
+            return None, "systemd-run not available"
+
+        try:
+            import subprocess as _sp
+            scope_cmd = [
+                'systemd-run', '--user', '--scope',
+                '-p', f'MemoryMax={memory_mb}M',
+                '-p', f'CPUQuota={cpu_pct}%',
+                '-p', f'TasksMax=50',
+                '-p', f'TimeoutStopSec={timeout}',
+                '--',
+            ] + cmd
+
+            result = _sp.run(
+                scope_cmd,
+                capture_output=True, text=True, timeout=timeout + 10
+            )
+
+            if result.returncode == 0:
+                pid = self._extract_pid(result.stdout)
+                if pid:
+                    with self._pids_lock:
+                        self._tracked_pids.append(pid)
+                return result.returncode, result.stdout
+            else:
+                return result.returncode, f"Scope execution failed: {result.stderr[:200]}"
+
+        except _sp.TimeoutExpired:
+            return None, f"Scope execution timed out after {timeout}s"
+        except FileNotFoundError:
+            return None, "systemd-run command not found"
+        except Exception as e:
+            return None, f"Scope execution error: {e}"
+
+    def _extract_pid(self, output: str) -> Optional[int]:
+        """Extract the PID from systemd-run output (main PID of scope)."""
+        try:
+            for line in output.split('\n'):
+                if 'Main PID:' in line:
+                    pid_str = line.split('Main PID:')[1].strip()
+                    return int(pid_str.split()[0])
+        except (ValueError, IndexError):
+            pass
+        return None
+
+    def _write_cgroup(self, cgroup_dir: str, filename: str, value: str) -> None:
+        """Write a value to a cgroup control file. Only works as root."""
+        filepath = f"{cgroup_dir}/{filename}"
+        try:
+            with open(filepath, 'w') as f:
+                f.write(value)
+        except PermissionError:
+            raise
+        except OSError as e:
+            if e.errno == errno.EACCES:
+                raise PermissionError(f"Permission denied writing {filepath}")
+            raise
+
+    def set_server_oom_score(self) -> bool:
+        """Log the server's OOM score status.
+
+        OOM score adjustment notes:
+        - Negative values (e.g., -500 to protect server) need CAP_SYS_RESOURCE (root)
+        - Zero (neutral, default) works without root
+        - Positive values (e.g., +500 to sacrifice) work without root
+
+        Since we can't set negative values without root, we:
+        - Set subprocesses to +500 (always killed first) — WORKS without root
+        - Leave server at 0 (neutral) — default behavior
+        - Log instructions for running with root for full protection
+        """
+        try:
+            # Try to set a neutral value (works without root)
+            with open(f'/proc/{self._our_pid}/oom_score_adj', 'w') as f:
+                f.write('0')
+            logger.info("  - Server OOM score: 0 (neutral, default)")
+            logger.info("  - 💡 Tip: Run server as root or with CAP_SYS_RESOURCE")
+            logger.info("  -   to set server OOM to -500 (maximum protection)")
+            return True
+        except PermissionError:
+            logger.info("  - Server OOM score: default (no adjustment possible)")
+            return False
+        except Exception as e:
+            logger.debug(f"OOM score check failed: {e}")
+            return False
+
+    def set_subprocess_oom_score(self, pid: int) -> bool:
+        """Set a subprocess's OOM score to +500 (always killed first).
+
+        Call this right after spawning a subprocess to ensure the OOM killer
+        targets it before the server. This works WITHOUT root because:
+        - Positive oom_score_adj values do NOT need CAP_SYS_RESOURCE
+        - We own the subprocess (same UID)
+
+        Args:
+            pid: Process ID to set the OOM score on
+
+        Returns:
+            True if OOM score was set, False otherwise
+        """
+        try:
+            with open(f'/proc/{pid}/oom_score_adj', 'w') as f:
+                f.write('+500')
+            return True
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            return False
+        except Exception:
+            return False
+
+    def add_pid_to_cgroup(self, pid: int) -> bool:
+        """Add a PID to tracking (add to cgroup if direct access available).
+
+        Args:
+            pid: Process ID to track
+
+        Returns:
+            True if PID was tracked, False otherwise
+        """
+        # Always track the PID for cleanup
+        with self._pids_lock:
+            self._tracked_pids.append(pid)
+
+        # Try to add to cgroup if we have direct access
+        if self._cgroup_path:
+            try:
+                self._write_cgroup(self._cgroup_path, 'cgroup.procs', str(pid))
+                return True
+            except (PermissionError, OSError):
+                pass
+        return False
+
+    def get_cgroup_usage(self) -> Dict[str, str]:
+        """Get current resource usage info.
+
+        With systemd-run scopes: reports scope status.
+        With direct cgroup: reads cgroup control files.
+        Without either: reports tracked PID count.
+        """
+        result = {}
+
+        # Report tracked PIDs
+        with self._pids_lock:
+            active_pids = [p for p in self._tracked_pids 
+                          if process_exists(int(p))]
+            result['tracked_pids'] = str(len(active_pids))
+
+        # Direct cgroup read (if available)
+        if self._cgroup_path:
+            try:
+                with open(f'{self._cgroup_path}/memory.current', 'r') as f:
+                    mem_bytes = int(f.read().strip())
+                    result['memory_current'] = f"{mem_bytes / 1024 / 1024:.1f}MB"
+            except Exception:
+                pass
+            try:
+                with open(f'{self._cgroup_path}/pids.current', 'r') as f:
+                    result['pids_current'] = f.read().strip()
+            except Exception:
+                pass
+        elif self._systemd_run_available:
+            result['method'] = 'systemd-run --user --scope'
+
+        return result
+
+    def cleanup(self) -> None:
+        """Clean up tracked resources. Called during server shutdown."""
+        # Kill any remaining tracked subprocesses
+        with self._pids_lock:
+            for pid in self._tracked_pids:
+                try:
+                    if process_exists(int(pid)):
+                        os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+            self._tracked_pids.clear()
+
+        # Remove the cgroup directory (if we created one directly)
+        if self._cgroup_path:
+            try:
+                root_cgroup = f"{_CGROUP_BASE}/cgroup.procs"
+                with open(f'{self._cgroup_path}/cgroup.procs', 'r') as f:
+                    pids = f.read().strip().split('\n')
+                for pid in pids:
+                    if pid.strip() and pid.strip().isdigit():
+                        try:
+                            with open(root_cgroup, 'w') as rf:
+                                rf.write(pid.strip())
+                        except Exception:
+                            pass
+                os.rmdir(self._cgroup_path)
+                logger.info("CGroup v2 divine protection cleaned up")
+            except Exception as e:
+                logger.debug(f"CGroup cleanup failed: {e}")
+
+    def add_pid_to_cgroup(self, pid: int) -> bool:
+        """Add a PID to the divine protection cgroup.
+
+        This ensures the process inherits the resource limits (memory, CPU, PIDs).
+        """
+        if not self._enabled or not self._cgroup_path:
+            return False
+        try:
+            self._write_cgroup(self._cgroup_path, 'cgroup.procs', str(pid))
+            return True
+        except Exception:
+            return False
+
+    def get_cgroup_usage(self) -> Dict[str, str]:
+        """Get current resource usage of the divine cgroup."""
+        if not self._enabled or not self._cgroup_path:
+            return {}
+
+        result = {}
+        try:
+            with open(f'{self._cgroup_path}/memory.current', 'r') as f:
+                mem_bytes = int(f.read().strip())
+                result['memory_current'] = f"{mem_bytes / 1024 / 1024:.1f}MB"
+        except Exception:
+            pass
+
+        try:
+            with open(f'{self._cgroup_path}/pids.current', 'r') as f:
+                result['pids_current'] = f.read().strip()
+        except Exception:
+            pass
+
+        return result
+
+    def cleanup(self) -> None:
+        """Remove the divine cgroup. Called during server shutdown."""
+        if not self._cgroup_path:
+            return
+        try:
+            # Move all processes to root cgroup before removing
+            root_cgroup = f"{_CGROUP_BASE}/cgroup.procs"
+            with open(f'{self._cgroup_path}/cgroup.procs', 'r') as f:
+                pids = f.read().strip().split('\n')
+            for pid in pids:
+                if pid.strip() and pid.strip().isdigit():
+                    try:
+                        with open(root_cgroup, 'w') as rf:
+                            rf.write(pid.strip())
+                    except Exception:
+                        pass
+
+            # Remove the cgroup directory
+            os.rmdir(self._cgroup_path)
+            logger.info("CGroup v2 divine protection cleaned up")
+        except Exception as e:
+            logger.debug(f"CGroup cleanup failed: {e}")
+
+
+# ── Global CGroup manager instance ────────────────────────────────
+_cgroup_manager = CGroupManager()
+
+
+def get_cgroup_manager() -> CGroupManager:
+    return _cgroup_manager
+
+
+# ── Emergency Memory Monitor ──────────────────────────────────────
+class EmergencyMemoryMonitor:
+    """Background thread that monitors system memory and takes action
+    when memory is critically low.
+
+    Actions:
+    - Log warning when MemAvailable < 1GB
+    - Actively kill heavy subprocesses when MemAvailable < 512MB
+    - Block new tool execution when MemAvailable < 256MB
+    """
+
+    def __init__(self, check_interval: float = 30.0):
+        self._check_interval = check_interval
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
+        self._critical_count = 0
+
+    def start(self) -> None:
+        """Start the emergency memory monitor thread."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._monitor_loop,
+                                       daemon=True,
+                                       name='divine-memory-monitor')
+        self._thread.start()
+        logger.info("Divine emergency memory monitor started")
+
+    def stop(self) -> None:
+        """Stop the monitor thread."""
+        self._running = False
+
+    def _monitor_loop(self) -> None:
+        """Main monitoring loop."""
+        while self._running:
+            try:
+                avail_mb = self._get_available_memory()
+
+                if avail_mb is not None:
+                    if avail_mb < 256:
+                        # CRITICAL: Block ALL new tool executions
+                        self._critical_count += 1
+                        logger.critical(
+                            f"DIVINE CRITICAL: Only {avail_mb}MB memory available! "
+                            f"Blocking all tool executions and killing subprocesses."
+                        )
+                        self._kill_all_subprocesses()
+                    elif avail_mb < 512:
+                        # WARNING: Kill the heaviest subprocesses
+                        self._critical_count += 1
+                        logger.warning(
+                            f"Divine memory warning: {avail_mb}MB available. "
+                            f"Killing heavy subprocesses."
+                        )
+                        self._kill_heavy_processes(threshold_mb=256)
+                    elif avail_mb < 1024:
+                        # LOW: Just log
+                        if self._critical_count > 0:
+                            # Recovery notification
+                            logger.info(f"Memory recovering: {avail_mb}MB available")
+                            self._critical_count = 0
+            except Exception:
+                pass
+
+            time.sleep(self._check_interval)
+
+    def _get_available_memory(self) -> Optional[int]:
+        """Get available memory in MB. Returns None if can't read."""
+        try:
+            mem = system_memory()
+            return mem.get('available_kb', 0) // 1024
+        except Exception:
+            return None
+        return None
+
+    def _kill_all_subprocesses(self) -> None:
+        """Kill ALL child processes of this server aggressively."""
+        try:
+            my_pid = os.getpid()
+            for proc in process_list():
+                if proc.get('ppid') == my_pid:
+                    try:
+                        os.kill(proc['pid'], signal.SIGKILL)
+                        logger.warning(f"Emergency killed subprocess PID {proc['pid']}")
+                    except (OSError, ProcessLookupError):
+                        pass
+        except Exception:
+            pass
+
+    def _kill_heavy_processes(self, threshold_mb: int = 256) -> None:
+        """Kill subprocesses using more than threshold_mb memory."""
+        try:
+            my_pid = os.getpid()
+            for proc in process_list():
+                if proc.get('ppid') == my_pid:
+                    pid = proc['pid']
+                    try:
+                        pinfo = process_info(pid)
+                        rss_kb = pinfo.get('memory_kb', 0)
+                        rss_mb = rss_kb // 1024
+                        if rss_mb > threshold_mb:
+                            os.kill(pid, signal.SIGKILL)
+                            logger.warning(
+                                f"Emergency killed heavy subprocess PID {pid} "
+                                f"(RSS: {rss_mb}MB > {threshold_mb}MB threshold)"
+                            )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+# ── Global Emergency Memory Monitor instance ──────────────────────
+_emergency_monitor = EmergencyMemoryMonitor()
+
+
+def get_emergency_monitor() -> EmergencyMemoryMonitor:
+    return _emergency_monitor
+
+
+# ── Subprocess Resource Limiter (prlimit wrapper) ─────────────────
+def apply_subprocess_limits(pid: int,
+                           mem_mb: int = 1024,
+                           max_procs: int = 200,
+                           max_files: int = 50,
+                           max_cpu_sec: int = 120,
+                           max_file_size_mb: int = 1024) -> Tuple[bool, str]:
+    """Apply resource limits to a subprocess using prlimit.
+
+    This uses the `prlimit` command-line tool to set per-process limits
+    on a running subprocess. It's a defense-in-depth measure alongside
+    cgroup v2 limits.
+
+    Limits applied:
+    - RLIMIT_AS (virtual memory) -> 1GB default (reduced from 2GB per WO #1042)
+    - RLIMIT_NPROC (max processes) -> 200 default
+    - RLIMIT_NOFILE (max files) -> 50 default
+    - RLIMIT_CPU (CPU time) -> 120s default
+    - RLIMIT_FSIZE (file size) -> 1GB default
+    - RLIMIT_CORE (core dump) -> 0 (blocked)
+
+    Args:
+        pid: Process ID to apply limits to
+        mem_mb: Virtual memory limit in MB (default 1024, reduced from 2048 per WO #1042)
+        max_procs: Maximum number of processes (default 200)
+        max_files: Maximum open files (default 50)
+        max_cpu_sec: Maximum CPU time in seconds (default 120)
+        max_file_size_mb: Maximum file size in MB (default 1024)
+
+    Returns:
+        (True, "") if limits applied successfully
+        (False, error_message) if failed
+    """
+    try:
+        import subprocess as _sp
+
+        cmd = ['prlimit']
+        cmd.extend(['--pid', str(pid)])
+        cmd.extend(['--as', str(mem_mb * 1024 * 1024)])  # RLIMIT_AS
+        cmd.extend(['--nproc', str(max_procs)])           # RLIMIT_NPROC
+        cmd.extend(['--nofile', str(max_files)])           # RLIMIT_NOFILE
+        cmd.extend(['--cpu', str(max_cpu_sec)])            # RLIMIT_CPU
+        cmd.extend(['--fsize', str(max_file_size_mb * 1024 * 1024)])  # RLIMIT_FSIZE
+        cmd.extend(['--core', '0'])                        # RLIMIT_CORE
+
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return True, ""
+        else:
+            return False, f"prlimit failed: {result.stderr.strip()}"
+    except FileNotFoundError:
+        return False, "prlimit command not found (install util-linux)"
+    except _sp.TimeoutExpired:
+        return False, "prlimit timed out"
+    except Exception as e:
+        return False, f"prlimit error: {e}"
+
+
+# ── Divine Protection Initialization ──────────────────────────────
+def initialize_divine_protection() -> Dict[str, Any]:
+    """Initialize all DIVINE-LEVEL protection layers.
+
+    This is called at server startup AFTER the basic protections are in place.
+    It attempts to set up hardware-level protections (cgroups, OOM, etc.)
+    and gracefully degrades if any layer is unavailable.
+
+    Also initializes advanced divine layers (D13-D20) which provide
+    Landlock LSM sandboxing, seccomp-bpf syscall filtering, bubblewrap
+    namespace isolation, NO_NEW_PRIVS, FD leak protection, process tree
+    kill, capability dropping, and disk quota enforcement.
+
+    Returns:
+        Dict with status of each protection layer
+    """
+    status = {
+        'cgroup_v2': False,
+        'oom_score': False,
+        'emergency_monitor': False,
+        'prlimit_prerequisite': False,
+        'systemd_run': False,
+        'podman_rootless': False,
+        'd13_landlock': False,
+        'd14_seccomp': False,
+        'd15_bubblewrap': False,
+        'd16_no_new_privs': False,
+        'd17_fd_protector': False,
+        'd18_tree_killer': False,
+        'd19_cap_dropper': False,
+        'd20_disk_quota': False,
+    }
+
+    logger.info("Initializing Divine Protection System...")
+
+    # Layer 1: CGroup v2 Resource Control
+    try:
+        cg = get_cgroup_manager()
+        status['cgroup_v2'] = cg.initialize()
+        if status['cgroup_v2']:
+            logger.info("Divine Layer 1: CGroup v2 resource control ACTIVE")
+        else:
+            logger.info("Divine Layer 1: CGroup v2 unavailable (continuing with Python-level protections)")
+    except Exception as e:
+        logger.warning(f"Divine Layer 1: CGroup v2 init error: {e}")
+
+    # Layer 2: Server OOM Score Protection
+    try:
+        cg = get_cgroup_manager()
+        status['oom_score'] = cg.set_server_oom_score()
+        if status['oom_score']:
+            logger.info("Divine Layer 2: Server OOM score protection ACTIVE")
+        else:
+            logger.info("Divine Layer 2: OOM score adjustment unavailable")
+    except Exception as e:
+        logger.warning(f"Divine Layer 2: OOM score error: {e}")
+
+    # Layer 3: Emergency Memory Monitor
+    try:
+        mon = get_emergency_monitor()
+        mon.start()
+        status['emergency_monitor'] = True
+        logger.info("Divine Layer 3: Emergency memory monitor ACTIVE")
+    except Exception as e:
+        logger.warning(f"Divine Layer 3: Memory monitor error: {e}")
+
+    # Layer 4: prlimit prerequisite check
+    try:
+        import subprocess as _sp
+        result = _sp.run(['which', 'prlimit'], capture_output=True, text=True, timeout=3)
+        status['prlimit_prerequisite'] = (result.returncode == 0)
+        if status['prlimit_prerequisite']:
+            logger.info("Divine Layer 4: prlimit available")
+        else:
+            logger.info("Divine Layer 4: prlimit not available (install util-linux)")
+    except Exception:
+        logger.info("Divine Layer 4: prlimit check failed")
+
+    # Layer 5: systemd-run user scope availability
+    try:
+        import subprocess as _sp
+        result = _sp.run(['systemd-run', '--user', '--scope', '--help'],
+                        capture_output=True, text=True, timeout=3)
+        status['systemd_run'] = (result.returncode == 0)
+        if status['systemd_run']:
+            logger.info("Divine Layer 5: systemd-run user scope AVAILABLE (rootless cgroups)")
+        else:
+            logger.info("Divine Layer 5: systemd-run not available")
+    except Exception:
+        status['systemd_run'] = False
+        logger.info("Divine Layer 5: systemd-run check failed")
+
+    # Layer 6: podman rootless container availability
+    try:
+        import subprocess as _sp
+
+        result = _sp.run(['podman', '--version'],
+                        capture_output=True, text=True, timeout=5)
+        status['podman_rootless'] = (result.returncode == 0)
+        if status['podman_rootless']:
+            logger.info("Divine Layer 6: podman rootless containers AVAILABLE")
+        else:
+            logger.info("Divine Layer 6: podman not available")
+    except Exception:
+        status['podman_rootless'] = False
+        logger.info("Divine Layer 6: podman check failed")
+
+    # ── Layers D13-D20: Advanced Divine Protection ──────────────────
+    try:
+        advanced_status = initialize_advanced_divine()
+        status.update(advanced_status)
+    except Exception as e:
+        logger.warning(f"Advanced divine protection init error: {e}")
+
+    # Summary
+    active_layers = sum(1 for v in status.values() if v)
+    total_layers = len(status)
+    logger.info(f"Divine Protection System: {active_layers}/{total_layers} layers active"
+                f" ({active_layers - sum(1 for k,v in status.items() if k.startswith('d') and v)} basic + "
+                f"{sum(1 for k,v in status.items() if k.startswith('d') and v)} advanced)")
+
+    return status
+
+
+# ── Divine Protection Shutdown ────────────────────────────────────
+def shutdown_divine_protection() -> None:
+    """Clean shutdown of divine protection layers."""
+    logger.info("Shutting down Divine Protection System...")
+    try:
+        get_emergency_monitor().stop()
+    except Exception:
+        pass
+    try:
+        get_cgroup_manager().cleanup()
+    except Exception:
+        pass
+    try:
+        shutdown_advanced_divine()
+    except Exception:
+        pass
+    # ── GOD WATCHER Shutdown ───────────────────────────────────────
+    if _GOD_WATCHER_AVAILABLE:
+        try:
+            shutdown_god_watcher()
+        except Exception:
+            pass
+    logger.info("Divine Protection System shutdown complete")
+

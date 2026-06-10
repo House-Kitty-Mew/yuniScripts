@@ -1,0 +1,12 @@
+[script]
+name = Example Game Server
+version = 1.0.0
+description = Template for a long-running game server with process adoption support
+category = servers
+entry_point = main.py
+enabled = true
+server_type = long_running
+shutdown_timeout = 30
+restart_policy = always
+watch_patterns = *.py
+ports = 25565

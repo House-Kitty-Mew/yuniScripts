@@ -1,0 +1,7 @@
+{
+    "remote_host": "YOUR_SERVER_IP",
+    "remote_port": 5559,
+    "auth_token": "YOUR_AUTH_TOKEN",
+    "poll_interval_seconds": 10,
+    "command_port": 25570
+}

@@ -1,0 +1,1 @@
+# LootPower Test Suite

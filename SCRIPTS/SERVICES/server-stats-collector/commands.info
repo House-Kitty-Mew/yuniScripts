@@ -1,0 +1,5 @@
+[commands]
+latest = Return the most recent server stats as JSON
+history <minutes> = Return stats from the last N minutes (JSON array)
+config = Show current collector configuration
+reload-config = Reload config.json without restarting the script

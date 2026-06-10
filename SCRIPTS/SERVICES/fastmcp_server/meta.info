@@ -1,0 +1,13 @@
+[script]
+name = FastMCP Server (YuniScript Managed)
+version = 1.0.0
+description = FastMCP server wrapped as YuniScript with Phooks tool routing and debug hooks for self-healing AI ecosystem
+category = services
+entry_point = main.py
+enabled = true
+server_type = critical
+shutdown_timeout = 60
+restart_policy = always
+watch_patterns = *.py
+ports = 0
+dependencies = fastmcp, sqlite3

@@ -1,0 +1,11 @@
+[script]
+name = Item Signing Bridge
+version = 1.0.0
+description = Receives encrypted signing requests from Minescript and forwards to MC Manager
+category = services
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py, config.json
+requirements_file = requirements.txt
+ports = 25571

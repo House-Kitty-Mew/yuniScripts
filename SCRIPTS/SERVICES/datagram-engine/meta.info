@@ -1,0 +1,13 @@
+[script]
+name = Datagram Engine Module
+version = 1.0.0
+description = Forward/backward compatible data archival engine as a YuniScript module. Allows scripts to load, create, and manipulate datagrams (versioned data archives with integrity hashing, embedded functions, and multi-type database support).
+category = services
+entry_point = main.py
+enabled = true
+server_type = standard
+shutdown_timeout = 10
+restart_policy = on-failure
+watch_patterns = *.py
+ports = 0
+dependencies = python3, sqlite3

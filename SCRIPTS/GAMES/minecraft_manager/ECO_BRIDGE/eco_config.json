@@ -1,0 +1,17 @@
+{
+    "ooga_db_path": "",
+    "eco_bridge_host": "192.168.1.118",
+    "eco_bridge_port": 7200,
+    "eco_bridge_password": "change-me-bridge-key-2026!!",
+    "rcon_host": "192.168.1.118",
+    "rcon_port": 25575,
+    "rcon_password": "Cobblemaster23!",
+    "rcon_primary": true,
+    "rcon_timeout_seconds": 3.0,
+    "log_all_operations": true,
+    "enable_standalone_phooks": false,
+    "standalone_phooks_port": 25573,
+    "max_delta_per_transaction": 100000,
+    "min_balance": 0,
+    "write_reason_prefix": "AH_BRIDGE:"
+}

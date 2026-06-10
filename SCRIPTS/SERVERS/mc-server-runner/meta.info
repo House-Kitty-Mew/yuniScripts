@@ -1,0 +1,13 @@
+[script]
+name = MC Server Runner Manager
+version = 1.0.0
+description = Complete sandboxed Minecraft server runner with VFS, virtual networking, and full mod system
+category = games
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py, *.json
+
+DATA/config.json
+requirements_file = requirements.txt
+# Virtual port map: 25565 (MC), 25575 (RCON), 8000 (Admin API)

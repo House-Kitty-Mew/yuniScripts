@@ -1,0 +1,10 @@
+[script]
+name = Log Viewer
+version = 1.0.0
+description = Opens real‑time log windows for any script
+category = tools
+entry_point = main.py
+enabled = true
+restart_policy = on-failure
+watch_patterns = *.py
+ports =

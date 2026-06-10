@@ -1,0 +1,80 @@
+═══════════════════════════════════════════════════════════════
+  ECONOMY BRIDGE — DEPLOYMENT GUIDE
+═══════════════════════════════════════════════════════════════
+
+Architecture:
+  mc_manager (machine A)              Server machine
+  ┌──────────────────────┐            ┌──────────────────────┐
+  │  eco_bridge_client   │──AES-256──►│  eco_bridge_server   │
+  │  (all logic here)    │◄───────────│  (thin DB connector)  │
+  │  imported by ah_core │   TCP :7200│  → project_ooga.db   │
+  └──────────────────────┘            └──────────────────────┘
+
+Step 1: On the SERVER machine (where Minecraft runs)
+─────────────────────────────────────────────────────────────
+
+Copy these files to the server:
+  eco_bridge_server.py
+  crypto_fallback.py       (included alongside bridge)
+
+Run:
+  python3 eco_bridge_server.py \
+    --db /path/to/config/otters_civ_revived/project_ooga.db \
+    --key "your-shared-secret-here"
+
+Better yet, set the key as environment variable:
+  export ECO_BRIDGE_KEY="your-shared-secret-here"
+  python3 eco_bridge_server.py
+
+The server listens on port 7200 (default).  Change with --port.
+Use --host 0.0.0.0 to accept connections from any network.
+
+Step 2: On the mc_manager machine
+─────────────────────────────────────────────────────────────
+
+Edit `DATA/eco_config.json` and set:
+  {
+    "eco_bridge_host": "192.168.1.100",        ← Server machine IP
+    "eco_bridge_port": 7200,
+    "eco_bridge_password": "your-shared-secret-here"
+  }
+
+Or set environment variable:
+  export ECO_BRIDGE_HOST="192.168.1.100"
+  export ECO_BRIDGE_KEY="your-shared-secret-here"
+
+Step 3: Start mc_manager
+─────────────────────────────────────────────────────────────
+
+python3 main.py
+
+On startup, it will:
+  1. Ping the bridge to verify connection
+  2. Log bridge status (connected / fallback)
+  3. Begin using the bridge for all AH balance operations
+
+Step 4: Verify
+─────────────────────────────────────────────────────────────
+
+From the server machine, test the connection:
+  echo '{"action":"stats"}' | timeout 3 nc localhost 7200
+
+Or from mc_manager, type:
+  ah status
+
+It will show bridge connection status.
+
+Security Notes
+─────────────────────────────────────────────────────────────
+  • AES-256-GCM encryption over TCP (same encryption as sign_item)
+  • Shared key must match on both sides
+  • Change the default key BEFORE deploying
+  • Set ECO_BRIDGE_KEY env var instead of putting key in config file
+  • Port 7200 should be firewalled to only allow the mc_manager IP
+  • For production: use a VPN or SSH tunnel instead of exposing port 7200
+
+Fallback Behavior
+─────────────────────────────────────────────────────────────
+  • If the bridge is unreachable: AH falls back to RCON + internal balances
+  • No data loss — transactions are queued and retried
+  • On reconnect, bridge automatically resumes

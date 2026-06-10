@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+
+# Logs
+engine/logs/
+*.log
+
+# Databases (auto-created)
+*.db3
+*.db3-shm
+*.db3-wal
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Dependencies
+_deps/
+
+# Config overrides (user-specific, NOT the example files)
+**/config.json
+!**/config.example.json
+**/players.keys
+!**/players.example.keys
+
+# Generated keys
+minescript/generated_keys.ini
+minescript/sign_item_keys.ini
+!minescript/sign_item_keys.example.ini
+
+# Runtime
+data_packs/
+
+# PID files (adopted processes survive engine crash)
+engine/pids/*.pid
+!engine/pids/.gitkeep
+
+# Large binaries
+*.AppImage
+SCRIPTS/SERVICES/DATA/Alerts/*.json
