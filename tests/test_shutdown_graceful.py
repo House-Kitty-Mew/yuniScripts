@@ -249,15 +249,16 @@ for name, cfg in types.items():
 # RESULTS
 # ═══════════════════════════════════════════════════════════════════════
 
-section("RESULTS")
+if __name__ == "__main__":
+    section("RESULTS")
 
-print(f"  {_G}{_tests_pass} passed{_N}")
-if _tests_fail:
-    print(f"  {_R}{_tests_fail} failed{_N}")
-print(f"  {_C}{_tests_run} total{_N}")
+    print(f"  {_G}{_tests_pass} passed{_N}")
+    if _tests_fail:
+        print(f"  {_R}{_tests_fail} failed{_N}")
+    print(f"  {_C}{_tests_run} total{_N}")
 
-if _tests_fail:
-    print(f"\n  {_R}Some tests FAILED — review above.{_N}")
-    sys.exit(1)
-else:
-    print(f"\n  {_G}All shutdown tests passed.{_N}")
+    if _tests_fail:
+        print(f"\n  {_R}Some tests FAILED — review above.{_N}")
+        sys.exit(1)
+    else:
+        print(f"\n  {_G}All shutdown tests passed.{_N}")

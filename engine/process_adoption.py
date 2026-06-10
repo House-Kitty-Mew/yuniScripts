@@ -227,6 +227,8 @@ def _is_process_alive_windows(pid: int) -> bool:
 
     Uses PROCESS_QUERY_INFORMATION (0x0400) to avoid modifying the process.
     """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
@@ -249,6 +251,8 @@ def _is_process_alive_windows(pid: int) -> bool:
 
 def _is_process_alive_unix(pid: int) -> bool:
     """Unix-specific process detection via os.kill(pid, 0)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -276,8 +280,8 @@ def check_port_in_use(host: str, port: int, timeout: float = DEFAULT_PORT_CHECK_
         False if connection timed out or host unreachable
 
     Note:
-        A "connection refused" response also indicates the port is occupied
-        (something was listening briefly). We treat this as "in use" to be safe.
+        Only a successful connection (result == 0) means the port is actively
+        in use. ECONNREFUSED means nothing is listening on that port.
     """
     if port <= 0 or port > 65535:
         return False
@@ -289,13 +293,11 @@ def check_port_in_use(host: str, port: int, timeout: float = DEFAULT_PORT_CHECK_
         sock.close()
         # connect_ex returns 0 on success, 111 (ECONNREFUSED) if nothing listening,
         # 110 (ETIMEDOUT) if timeout, etc.
-        # We consider both "connected" and "connection refused" as "in use"
-        # because a port that recently closed may still be in TIME_WAIT.
+        # Only a successful connection confirms the port is in use.
+        # ECONNREFUSED means nothing is listening — the port is free.
         if result == 0:
             return True  # Active connection
-        if result == 111:  # ECONNREFUSED — was recently in use
-            return True
-        return False  # Timeout or other error — port likely free
+        return False  # ECONNREFUSED, ETIMEDOUT, etc. — port is free
     except (socket.gaierror, OSError):
         return False
     except Exception:
@@ -537,6 +539,8 @@ def _kill_process(pid: int) -> bool:
     Returns:
         True if termination was attempted (doesn't guarantee success)
     """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         if sys.platform == "win32":
             import ctypes
