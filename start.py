@@ -176,7 +176,7 @@ def check_engine_deps() -> bool:
             print(green("found"))
         else:
             print(red("MISSING"))
-            if not args.install_only and not args.check_only:
+            if not args.check_only:  # Install during --install-only or normal startup, skip during --check-only
                 # During normal startup, we try to install
                 if install_module(dep):
                     # Add deps path to sys for subsequent checks
