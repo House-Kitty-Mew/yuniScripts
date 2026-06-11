@@ -29,13 +29,13 @@ os.environ["YUNISCRIPTS_TEST_ROOT"] = str(_TEST_ROOT)
 import engine.config_loader as cl
 _orig_find_root = cl._find_project_root
 cl._find_project_root = lambda: _TEST_ROOT
-cl._DATA_DIR = None  # Force re-resolve
 
 from engine.config_loader import (
     get_data_dir, get_config_path, load_config, save_config,
     is_fresh_install, mark_setup_complete, migrate_old_config,
     _auto_migrate, _load_json, _load_ini, _save_ini,
     _CONFIG_NAMES, _LEGACY_PATHS, get_project_root,
+    _reset_test_state,
 )
 
 
@@ -47,8 +47,7 @@ class TestConfigLoaderBasics:
     """1. ConfigLoader basics."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -86,8 +85,7 @@ class TestJSONConfig:
     """2. JSON config load/save round-trip."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -131,8 +129,7 @@ class TestIniConfig:
     """3. INI config load/save round-trip."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -164,8 +161,7 @@ class TestMigration:
     """4. Legacy config migration."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
         _TEST_DATA.mkdir(parents=True)
@@ -242,8 +238,7 @@ class TestFreshInstall:
     """5. Fresh install detection."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -267,8 +262,7 @@ class TestSetupComplete:
     """6. Mark-setup-complete flow."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -294,8 +288,7 @@ class TestEdgeCases:
     """7. Edge cases: missing files, corrupt JSON, empty files."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -365,8 +358,7 @@ class TestDataFlow:
     """8. Full data flow: first-run-setup → write → load → verify."""
 
     def setup_method(self):
-        cl._DATA_DIR = None
-        cl._migrated.clear()
+        cl._reset_test_state()
         if _TEST_DATA.exists():
             shutil.rmtree(str(_TEST_DATA))
 
@@ -496,8 +488,7 @@ class TestDataFlow:
 def teardown_module():
     """Clean up the temporary test directory."""
     cl._find_project_root = _orig_find_root
-    cl._DATA_DIR = None
-    cl._migrated.clear()
+    cl._reset_test_state()
     try:
         shutil.rmtree(str(_TEST_ROOT))
     except PermissionError:

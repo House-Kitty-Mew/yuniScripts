@@ -344,6 +344,36 @@ def assert_valid_config(name: str, data: dict) -> dict:
             print(f"[config] ⚠ {err}")
     return data
 
+
+def _reset_test_state():
+    """Clear ALL cached module state for test isolation.
+
+    Call this in test setUp/setup_method to ensure a clean state
+    between test cases.  Resets project root, data dir, migrated set,
+    and config schemas so the next call to any function will fully
+    re-discover paths.
+    """
+    global _PROJECT_ROOT, _DATA_DIR
+    _PROJECT_ROOT = None
+    _DATA_DIR = None
+    _migrated.clear()
+    _CONFIG_SCHEMAS.clear()
+
+
+def _reset_test_state():
+    """Clear ALL cached module state for test isolation.
+
+    Call this in test setUp/setup_method to ensure a clean state
+    between test cases.  Resets project root, data dir, migrated set,
+    and config schemas so the next call to any function will fully
+    re-discover paths.
+    """
+    global _PROJECT_ROOT, _DATA_DIR
+    _PROJECT_ROOT = None
+    _DATA_DIR = None
+    _migrated.clear()
+    _CONFIG_SCHEMAS.clear()
+
 def is_fresh_install() -> bool:
     """Check if this is a fresh install by looking for engine_config."""
     ec_path = get_config_path("engine")
