@@ -43,7 +43,10 @@ jobs:
 
       - name: Run Core Tests (Process Adoption + Shutdown)
         run: |
-          python -m pytest tests/test_process_adoption.py tests/test_shutdown_graceful.py tests/test_cross_platform.py -v --tb=short
+          # These test files use a custom inline test framework (not pytest)
+          python tests/test_process_adoption.py
+          python tests/test_shutdown_graceful.py
+          python tests/test_cross_platform.py
 
       - name: Run Configuration Tests
         run: |
