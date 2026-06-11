@@ -26,44 +26,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# ── Colours ──────────────────────────────────────────────────────────
-_G = "\033[92m"
-_Y = "\033[93m"
-_R = "\033[91m"
-_C = "\033[96m"
-_N = "\033[0m"
+__test__ = False  # pytest: skip this file (run via `python tests/test_*.py`)
 
-PASS = f"{_G}PASS{_N}"
-FAIL = f"{_R}FAIL{_N}"
-SKIP = f"{_Y}SKIP{_N}"
+from tests.test_helpers import *
 
-_tests_run = 0
-_tests_pass = 0
-_tests_fail = 0
-_tests_skip = 0
 
-def test(name: str, condition: bool, detail: str = ""):
-    global _tests_run, _tests_pass, _tests_fail
-    _tests_run += 1
-    if condition:
-        _tests_pass += 1
-        print(f"  {PASS}  {name}")
-    else:
-        _tests_fail += 1
-        print(f"  {FAIL}  {name}")
-        if detail:
-            print(f"         {_Y}{detail}{_N}")
-
-test.__test__ = False
-
-def skip(name: str, reason: str = ""):
-    global _tests_skip
-    _tests_skip += 1
-    print(f"  {SKIP}  {name}  ({_Y}{reason}{_N})")
-
-def section(title: str):
-    print(f"\n{_C}─── {title} ───{_N}")
-    print(f"{_C}{'─' * (len(title) + 8)}{_N}")
 
 # ── Import the module under test ─────────────────────────────────────
 from engine.process_adoption import (
@@ -581,17 +548,4 @@ if __name__ == "__main__":
     # RESULTS
     # ═══════════════════════════════════════════════════════════════════════
 
-    section("RESULTS")
-
-    print(f"  {_G}{_tests_pass} passed{_N}")
-    if _tests_fail:
-        print(f"  {_R}{_tests_fail} failed{_N}")
-    if _tests_skip:
-        print(f"  {_Y}{_tests_skip} skipped{_N}")
-    print(f"  {_C}{_tests_run} total{_N}")
-
-    if _tests_fail:
-        print(f"\n  {_R}Some tests FAILED — review above.{_N}")
-        sys.exit(1)
-    else:
-        print(f"\n  {_G}All process adoption tests passed.{_N}")
+    report()

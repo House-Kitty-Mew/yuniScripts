@@ -1,0 +1,80 @@
+CUSTOM SOFTWARE LICENSE – PERSONAL USE ONLY
+Version 1.0
+
+Copyright (c) 2026 Donovan Galloway
+
+1. DEFINITIONS
+“Software” means the engine ecosystem and all associated custom code, scripts, assets, configuration files, documentation, and other materials provided by the Licensor under this license, excluding any Third-Party Components.
+
+“Third-Party Components” means any software, libraries, or other materials that are included with or linked to the Software but are not authored by the Licensor. Their respective owners retain all rights, title, and interest, including patent rights, and their use is governed by the original licenses provided with those components.
+
+“Licensor” means Donovan Galloway, the copyright and patent holder(s) of the Software.
+
+“You” (or “Licensee”) means an individual person exercising the permissions granted by this license.
+
+“Personal Use” means use of the Software by a natural person solely for non‑commercial, private purposes. It excludes any use that is directly or indirectly connected with:
+
+a business, organization, or legal entity of any kind,
+
+any activity intended to generate revenue, profit, or other commercial advantage,
+
+provision of services to third parties, whether paid or unpaid,
+
+use by employees, contractors, or agents of any company, even if the Software runs on personally owned hardware.
+
+2. LICENSE GRANT
+Subject to the terms of this license, the Licensor grants You a worldwide, royalty‑free, non‑exclusive, non‑transferable, non‑sublicensable license to:
+
+(a) Use the Software, in object code form only, exclusively for Personal Use;
+(b) Modify the Software, i.e., adapt, alter, or create derivative works of the source code, exclusively for Your own Personal Use.
+
+All other rights are expressly reserved by the Licensor.
+
+3. RESTRICTIONS
+You may not:
+
+use the Software (or any modification or derivative of it) for any Commercial Purpose, including but not limited to:
+
+selling, licensing, renting, or leasing it,
+
+using it in a product or service that is sold, licensed, or provided for a fee,
+
+using it to generate advertising or subscription revenue,
+
+deploying it within a company, organization, or government body, even if no direct revenue is generated;
+
+distribute, sublicense, publish, or otherwise make the Software available to any third party, in original or modified form;
+
+remove, obscure, or alter any copyright, patent, trademark, or other proprietary notices contained in the Software;
+
+use the Software in any way that violates applicable law.
+
+Any rights not explicitly granted in Section 2 are fully reserved by the Licensor. If You are uncertain whether a particular use is permitted, You must contact the Licensor for clarification.
+
+4. COMMERCIAL USE
+Commercial use of the Software, in whole or in part, is strictly prohibited unless You first obtain a separate, written commercial license agreement from the Licensor. The Licensor is not obligated to grant such an agreement and may condition any commercial license on payment of fees or royalties, as negotiated. Unauthorized commercial use will constitute copyright infringement and may give rise to legal action.
+
+5. OWNERSHIP AND THIRD‑PARTY COMPONENTS
+The Licensor retains all right, title, and interest in and to the Software, including all intellectual property rights (copyright, patent, trade secret, trademark, and any other rights) arising from the custom code and ecosystem. This license does not transfer any ownership.
+
+Patent rights of the Licensor: No patent license is granted under this license except to the extent necessary to use the Software in accordance with the personal‑use permissions granted herein.
+
+Third‑Party Components: All patent rights, copyrights, and other intellectual property rights in Third‑Party Components are retained by their original owners. This license does not grant any additional rights in those components. You must comply with the separate license terms that accompany each Third‑Party Component. The inclusion of a Third‑Party Component does not imply any endorsement or affiliation.
+
+6. DISCLAIMER OF WARRANTY
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON‑INFRINGEMENT. THE LICENSOR MAKES NO REPRESENTATION THAT THE SOFTWARE WILL BE ERROR‑FREE OR THAT IT WILL MEET YOUR REQUIREMENTS. YOU ASSUME ALL RISK AS TO THE QUALITY, PERFORMANCE, AND USE OF THE SOFTWARE.
+
+7. LIMITATION OF LIABILITY
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES (INCLUDING LOSS OF PROFITS, DATA, OR BUSINESS INTERRUPTION) ARISING OUT OF OR IN CONNECTION WITH THIS LICENSE OR THE USE OR INABILITY TO USE THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES. THE LICENSOR’S TOTAL AGGREGATE LIABILITY SHALL NOT EXCEED THE AMOUNT (IF ANY) ACTUALLY PAID BY YOU FOR THE SOFTWARE. SOME JURISDICTIONS DO NOT ALLOW LIMITATIONS ON IMPLIED WARRANTIES OR LIABILITY, SO THE ABOVE LIMITATIONS MAY NOT APPLY TO YOU.
+
+8. TERMINATION
+This license terminates automatically if You fail to comply with any of its terms. Upon termination, You must immediately cease all use of the Software and destroy all copies (including modifications) in Your possession. Sections 1, 3–7, 9, and this Section 8 shall survive termination.
+
+9. MISCELLANEOUS
+Governing Law: This license shall be governed by and construed in accordance with the laws of the State of Washington, USA, without regard to its conflict of laws principles. Any disputes arising under or in connection with this license shall be subject to the exclusive jurisdiction of the state and federal courts located in King County, Washington.
+
+Severability: If any provision of this license is held to be unenforceable, the remaining provisions shall remain in full force and effect.
+
+Entire Agreement: This license constitutes the entire agreement between the parties concerning the Software and supersedes all prior or contemporaneous oral or written communications.
+
+End of License Text
