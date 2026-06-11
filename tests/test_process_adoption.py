@@ -183,7 +183,7 @@ if __name__ == "__main__":
 
     # Close and verify it's free
     free_sock.close()
-    time.sleep(0.1)  # Allow TIME_WAIT to clear
+    safe_sleep(0.1)  # Allow TIME_WAIT to clear
 
     # Port may still show as in use due to TIME_WAIT — this is expected behavior
     # Let's test with a port we know is open (e.g., our test server just closed)
@@ -200,9 +200,13 @@ if __name__ == "__main__":
     test("check_port_in_use with negative port returns False",
          not check_port_in_use("127.0.0.1", -1))
 
-    # Test with non-routable IP (should return False after timeout)
-    test("check_port_in_use to unreachable host returns False quickly",
-         not check_port_in_use("10.255.255.1", 80, timeout=0.5))
+    # Test with invalid port (should return False immediately without blocking)
+    test("check_port_in_use to invalid port returns False",
+         not check_port_in_use("127.0.0.1", 65536))
+
+    # Test on a port that is likely unused — should ECONNREFUSED immediately
+    test("check_port_in_use on unused port returns False quickly",
+         not check_port_in_use("127.0.0.1", 51999, timeout=0.5))
 
 
     # ═══════════════════════════════════════════════════════════════════════

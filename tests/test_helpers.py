@@ -23,6 +23,7 @@ Design:
 """
 
 import sys
+import time
 
 # ── Encoding-safe Unicode detection ──────────────────────────────────
 _CAN_USE_UNICODE = False
@@ -53,6 +54,28 @@ _tests_run = 0
 _tests_pass = 0
 _tests_fail = 0
 _tests_skip = 0
+
+
+def safe_sleep(seconds: float, interval: float = 0.01) -> None:
+    """Sleep for `seconds` while handling KeyboardInterrupt gracefully.
+
+    On Windows GitHub Actions runners, time.sleep() can receive spurious
+    Ctrl+C / SIGINT signals from the process group or console, raising
+    KeyboardInterrupt.  This wrapper breaks the sleep into tiny intervals
+    and catches KeyboardInterrupt silently so the test can continue.
+
+    Args:
+        seconds: Total time to sleep, in seconds.
+        interval: Check interval (default 0.01s = 10ms).
+    """
+    elapsed = 0.0
+    while elapsed < seconds:
+        try:
+            time.sleep(min(interval, seconds - elapsed))
+        except KeyboardInterrupt:
+            # Spurious Ctrl+C on Windows CI — ignore and continue
+            pass
+        elapsed += interval
 
 
 def test(name: str, condition: bool, detail: str = ""):
@@ -98,7 +121,11 @@ def section(title: str):
 
 
 def report():
-    """Print final results summary and exit with appropriate code."""
+    """Print final results summary and exit with appropriate code.
+
+    Wraps sys.exit() in a try/except to handle KeyboardInterrupt gracefully
+    on platforms where exit signals can be interrupted (e.g. Windows CI).
+    """
     print(f"  {_G}{_tests_pass} passed{_N}")
     if _tests_fail:
         print(f"  {_R}{_tests_fail} failed{_N}")
@@ -108,6 +135,10 @@ def report():
 
     if _tests_fail:
         print(f"\n  {_R}Some tests FAILED \u2014 review above.{_N}")
-        sys.exit(1)
+        try:
+            sys.exit(1)
+        except KeyboardInterrupt:
+            # Spurious Ctrl+C on Windows CI — still exit with error code
+            sys.exit(1)
     else:
         print(f"\n  {_G}All tests passed.{_N}")

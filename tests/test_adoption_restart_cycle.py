@@ -65,10 +65,19 @@ def _dummy_script_instance(script_id: str, pid: int = None) -> Dict:
 
 
 def _run_dummy_server(timeout: float = 3.0) -> subprocess.Popen:
-    """Launch a dummy long-running Python process that sleeps."""
+    """Launch a dummy long-running Python process that sleeps.
+
+    Cross-platform: only registers SIGTERM handler if SIGTERM is available
+    (safe on Windows where signal.signal with SIGTERM may raise).
+    """
+    sigterm_code = (
+        "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))"
+        if hasattr(signal, 'SIGTERM')
+        else "# SIGTERM not available on this platform"
+    )
     code = (
         "import time, signal, sys; "
-        "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0)); "
+        f"{sigterm_code}; "
         f"time.sleep({timeout})"
     )
     return subprocess.Popen([sys.executable, "-c", code])

@@ -329,7 +329,13 @@ def check_script_status(script_instance: Dict) -> Dict:
 
     except Exception as e:
         logger.error(f"check_script_status failed: {e}")
-        return None
+        return {
+            "pid_alive": False,
+            "ports_open": False,
+            "pid": None,
+            "adoptable": False,
+            "status": "error",
+        }
     pid = read_pid_file(script_id)
     ports = script_instance["meta"].get("ports", [])
 
