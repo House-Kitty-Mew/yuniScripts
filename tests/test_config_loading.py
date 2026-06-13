@@ -429,7 +429,7 @@ if _tests_skip:
 print(f"  {_C}{_tests_run} total{_N}")
 
 if _tests_fail:
-    print(f"\n  {_R}Some tests FAILED — review above.{_N}")
+    _safe_print(f"\n  {_R}Some tests FAILED -- review above.{_N}")
     sys.exit(1)
 else:
     print(f"\n  {_G}All config loading tests passed.{_N}")

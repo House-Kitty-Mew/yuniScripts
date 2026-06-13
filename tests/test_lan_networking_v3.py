@@ -338,8 +338,8 @@ def test_state_registry_thread_safety():
             errors.append(f"Writer {ext_name}: {e}")
 
     threads = []
-    for ext in ["PEOPLE", "SOCIAL", "RELS"]:
-        t = threading.Thread(target=writer, args=(ext, 0, 50))
+    for i, ext in enumerate(["PEOPLE", "SOCIAL", "RELS"]):
+        t = threading.Thread(target=writer, args=(ext, i * 50, 50))
         threads.append(t)
         t.start()
 
@@ -439,16 +439,15 @@ def test_socket_recreation_e3():
         return
 
     client = PhooksClient("e3_test", listen_events=[], emit_events=[])
-    old_sock_fd = client.sock.fileno()
+    old_sock = client.sock
 
     # Simulate OSError by closing socket, then call emit
     client.sock.close()
     client.emit("test_event", {"data": "test"})
 
-    # Should have created a new socket
+    # Should have created a new socket (new object; fd may be reused on Linux)
     assert client.sock is not None
-    new_sock_fd = client.sock.fileno()
-    assert new_sock_fd != old_sock_fd, "Socket should have been recreated"
+    assert client.sock is not old_sock, "Socket should have been recreated (new object)"
     _pass("socket_recreation: socket recreated after OSError")
 
     try:

@@ -20,6 +20,8 @@ Design:
     - Add __test__ = False at module level in any test file using this framework
       to prevent pytest from collecting the entire file (these are run directly
       with `python tests/test_*.py`, NOT via pytest).
+    - All print() calls go through _safe_print() which handles encoding errors
+      on legacy Windows consoles (cp1252 can't encode →, —, etc.).
 """
 
 import sys
@@ -37,6 +39,25 @@ except Exception:
     pass
 
 _SEP = "\u2500" if _CAN_USE_UNICODE else "-"  # ─ or -
+
+
+# ── Encoding-safe print wrapper ─────────────────────────────────────
+def _safe_print(*args, **kwargs):
+    """Print with encoding error handling for legacy Windows consoles.
+
+    On Windows GitHub Actions runners, stdout encoding is often cp1252,
+    which cannot represent Unicode characters like -> or --.
+    This wrapper encodes the output string to stdout's encoding with
+    'replace' error handler, preventing UnicodeEncodeError crashes.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    text = " ".join(str(a) for a in args)
+    try:
+        safe_text = text.encode(encoding, errors="replace").decode(encoding)
+    except (LookupError, ValueError):
+        safe_text = text.encode("utf-8", errors="replace").decode("utf-8")
+    print(safe_text, **kwargs)
+
 
 # ── ANSI color constants (safe on all platforms) ─────────────────────
 _G = "\033[92m"  # green
@@ -73,23 +94,23 @@ def safe_sleep(seconds: float, interval: float = 0.01) -> None:
         try:
             time.sleep(min(interval, seconds - elapsed))
         except KeyboardInterrupt:
-            # Spurious Ctrl+C on Windows CI — ignore and continue
+            # Spurious Ctrl+C on Windows CI -- ignore and continue
             pass
         elapsed += interval
 
 
 def test(name: str, condition: bool, detail: str = ""):
-    """Record a single test result — PASS or FAIL with optional detail."""
+    """Record a single test result -- PASS or FAIL with optional detail."""
     global _tests_run, _tests_pass, _tests_fail
     _tests_run += 1
     if condition:
         _tests_pass += 1
-        print(f"  {PASS}  {name}")
+        _safe_print(f"  {PASS}  {name}")
     else:
         _tests_fail += 1
-        print(f"  {FAIL}  {name}")
+        _safe_print(f"  {FAIL}  {name}")
         if detail:
-            print(f"         {_Y}{detail}{_N}")
+            _safe_print(f"         {_Y}{detail}{_N}")
 
 
 test.__test__ = False  # tell pytest not to collect this function
@@ -102,22 +123,22 @@ def skip(name: str, reason: str = ""):
     msg = f"  {SKIP}  {name}"
     if reason:
         msg += f"  ({_Y}{reason}{_N})"
-    print(msg)
+    _safe_print(msg)
 
 
 def section(title: str):
     """Print a section header with Unicode-safe box-drawing characters.
 
     On terminals that support UTF-8 (Linux, macOS, Windows Terminal):
-        ─── Section Title ───
-        ──────────────────────
+        --- Section Title ---
+        ---------------------
 
     On legacy Windows consoles (cp1252):
         --- Section Title ---
         ---------------------
     """
-    print(f"\n{_C}{_SEP * 3} {title} {_SEP * 3}{_N}")
-    print(f"{_C}{_SEP * (len(title) + 8)}{_N}")
+    _safe_print(f"\n{_C}{_SEP * 3} {title} {_SEP * 3}{_N}")
+    _safe_print(f"{_C}{_SEP * (len(title) + 8)}{_N}")
 
 
 def report():
@@ -126,19 +147,19 @@ def report():
     Wraps sys.exit() in a try/except to handle KeyboardInterrupt gracefully
     on platforms where exit signals can be interrupted (e.g. Windows CI).
     """
-    print(f"  {_G}{_tests_pass} passed{_N}")
+    _safe_print(f"  {_G}{_tests_pass} passed{_N}")
     if _tests_fail:
-        print(f"  {_R}{_tests_fail} failed{_N}")
+        _safe_print(f"  {_R}{_tests_fail} failed{_N}")
     if _tests_skip:
-        print(f"  {_Y}{_tests_skip} skipped{_N}")
-    print(f"  {_C}{_tests_run} total{_N}")
+        _safe_print(f"  {_Y}{_tests_skip} skipped{_N}")
+    _safe_print(f"  {_C}{_tests_run} total{_N}")
 
     if _tests_fail:
-        print(f"\n  {_R}Some tests FAILED \u2014 review above.{_N}")
+        _safe_print(f"\n  {_R}Some tests FAILED -- review above.{_N}")
         try:
             sys.exit(1)
         except KeyboardInterrupt:
-            # Spurious Ctrl+C on Windows CI — still exit with error code
+            # Spurious Ctrl+C on Windows CI -- still exit with error code
             sys.exit(1)
     else:
-        print(f"\n  {_G}All tests passed.{_N}")
+        _safe_print(f"\n  {_G}All tests passed.{_N}")

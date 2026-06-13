@@ -70,7 +70,7 @@ if __name__ == "__main__":
 
     test("PID directory is within engine/", "engine" in str(pid_dir))
 
-    # Roundtrip: write → read → remove
+    # Roundtrip: write -> read -> remove
     script_id_1 = "GAMES/minecraft_manager"
     test(f"write_pid_file('{script_id_1}', {os.getpid()}) returns True",
          write_pid_file(script_id_1, os.getpid()))
@@ -225,15 +225,15 @@ if __name__ == "__main__":
         }
     }
 
-    # No PID file → not adoptable
+    # No PID file -> not adoptable
     status = check_script_status(mock_script)
-    test("No PID file → not adoptable",
+    test("No PID file -> not adoptable",
          not status["adoptable"] and status["pid"] is None)
 
     # Write our PID (we are alive but no ports configured)
     write_pid_file(mock_script["id"], os.getpid())
     status = check_script_status(mock_script)
-    test("Our PID alive, no ports → adoptable (ports_open == pid_alive)",
+    test("Our PID alive, no ports -> adoptable (ports_open == pid_alive)",
          status["adoptable"] and status["pid_alive"])
     remove_pid_file(mock_script["id"])
 
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     write_pid_file(mock_script["id"], os.getpid())
     status = check_script_status(mock_script)
     # Our PID is alive, but port 9999 is not in use
-    test("Our PID alive, port closed → not adoptable",
+    test("Our PID alive, port closed -> not adoptable",
          not status["ports_open"])
     remove_pid_file(mock_script["id"])
 
@@ -251,7 +251,7 @@ if __name__ == "__main__":
         "id": "test/no-exist",
         "meta": {"ports": [8888]}
     })
-    test("Non-existent script → not adoptable",
+    test("Non-existent script -> not adoptable",
          not status["adoptable"] and status["pid"] is None)
 
 
@@ -354,7 +354,7 @@ if __name__ == "__main__":
 
     section("8. Find and Adopt — High-Level Flow")
 
-    # Script with no PID file, server_type=normal → returns None (no attempt)
+    # Script with no PID file, server_type=normal -> returns None (no attempt)
     normal_script = {
         "id": "test/normal-no-adopt",
         "meta": {"server_type": "normal", "ports": []}
@@ -363,7 +363,7 @@ if __name__ == "__main__":
     test("Normal script: find_and_adopt returns None (no adoption attempted)",
          result is None)
 
-    # Script with no PID file, server_type=long_running → returns None (fresh start)
+    # Script with no PID file, server_type=long_running -> returns None (fresh start)
     fresh_script = {
         "id": "test/fresh-server",
         "meta": {"server_type": "long_running", "ports": []}
@@ -372,7 +372,7 @@ if __name__ == "__main__":
     test("Fresh server (no PID): find_and_adopt returns None",
          result is None)
 
-    # Script with PID pointing to us (alive) → should adopt
+    # Script with PID pointing to us (alive) -> should adopt
     write_pid_file("test/adopt-me", os.getpid())
     adopt_script = {
         "id": "test/adopt-me",
@@ -388,7 +388,7 @@ if __name__ == "__main__":
 
     remove_pid_file("test/adopt-me")
 
-    # Script with stale PID → adoption returns None, PID cleaned
+    # Script with stale PID -> adoption returns None, PID cleaned
     write_pid_file("test/stale-adopt", 999999999)
     stale_script = {
         "id": "test/stale-adopt",
